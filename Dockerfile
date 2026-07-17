@@ -12,8 +12,8 @@ RUN apt-get update \
 
 COPY requirements.txt .
 
-RUN python -m pip install --upgrade pip \
-    && python -m pip install -r requirements.txt
+RUN python -m pip install --upgrade "pip<25" "setuptools<81" wheel \
+    && python -m pip install --no-build-isolation -r requirements.txt
 
 COPY . .
 
