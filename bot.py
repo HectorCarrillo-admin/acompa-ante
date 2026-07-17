@@ -332,7 +332,7 @@ def corregir_transcripcion_comandos(texto: str) -> str:
                     mejor_puntaje = puntaje
                     mejor_canonica = canonica
 
-        if mejor_canonica and mejor_puntaje >= 0.72:
+        if mejor_canonica and mejor_puntaje >= 0.82:
             corregidos.append(mejor_canonica)
         else:
             corregidos.append(token)
@@ -1411,21 +1411,50 @@ def validar_fecha_iso(fecha: str) -> bool:
 
 
 def parsear_hora(texto: str) -> str | None:
+    """
+    Reconoce horas expresadas de varias formas:
+
+    - a las ocho
+    - alas ocho
+    - a la ocho
+    - las 8
+    - 8:00
+    - ocho de la mañana
+    - tres de la tarde
+    - nueve de la noche
+    - dos de la madrugada
+    """
     texto_n = normalizar(texto)
 
+    # Normalizar puntuación y errores frecuentes de transcripción.
+    texto_n = re.sub(r"[,.;:!?]", " ", texto_n)
+    texto_n = re.sub(r"\s+", " ", texto_n).strip()
+
+    texto_n = re.sub(r"\balas\b", "a las", texto_n)
+    texto_n = re.sub(
+        r"\ba la\s+(?=\d|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)",
+        "a las ",
+        texto_n,
+    )
+
+    # Corregir variantes frecuentes.
+    texto_n = texto_n.replace("madrugrada", "madrugada")
+    texto_n = texto_n.replace("madrujada", "madrugada")
+
+    # Hora numérica como 08:00 o 8h30.
     coincidencia = re.search(
-        r"\b([01]?\d|2[0-3]):([0-5]\d)\b",
+        r"\b([01]?\d|2[0-3])\s*[:h]\s*([0-5]\d)\b",
         texto_n,
     )
 
     if coincidencia:
-        return (
-            f"{int(coincidencia.group(1)):02d}:"
-            f"{int(coincidencia.group(2)):02d}"
-        )
+        hora = int(coincidencia.group(1))
+        minuto = int(coincidencia.group(2))
+        return f"{hora:02d}:{minuto:02d}"
 
+    # Hora numérica después de "a las" o "las".
     coincidencia = re.search(
-        r"\b(?:a las|las)\s+(\d{1,2})(?:\s+y\s+(\d{1,2}))?",
+        r"\b(?:a\s+las|las)\s+(\d{1,2})(?:\s+y\s+(\d{1,2}))?\b",
         texto_n,
     )
 
@@ -1451,43 +1480,86 @@ def parsear_hora(texto: str) -> str | None:
             "doce": 12,
         }
 
+        # Buscar primero una hora precedida por "a las" o "las".
         for palabra, valor in numeros.items():
             if re.search(
-                rf"\b(?:a las|las)\s+{palabra}\b",
+                rf"\b(?:a\s+las|las)\s+{palabra}\b",
                 texto_n,
             ):
                 hora = valor
                 break
 
+        # Respaldo: aceptar una hora escrita al final si el mensaje
+        # corresponde claramente a un comando de programación.
+        if hora is None and any(
+            palabra in texto_n
+            for palabra in [
+                "medicamento",
+                "medicina",
+                "pastilla",
+                "agregar",
+                "programar",
+                "registrar",
+                "evento",
+                "cita",
+                "agenda",
+            ]
+        ):
+            for palabra, valor in numeros.items():
+                if re.search(
+                    rf"\b{palabra}\b"
+                    rf"(?:\s+de\s+la\s+(?:manana|tarde|noche|madrugada))?"
+                    rf"\s*$",
+                    texto_n,
+                ):
+                    hora = valor
+                    break
+
     if hora is None:
         return None
 
+    # Minutos expresados con palabras.
     if "media" in texto_n:
         minuto = 30
     elif "cuarto" in texto_n:
         minuto = 15
 
-    if any(
-        periodo in texto_n
-        for periodo in [
-            "de la tarde",
-            "de la noche",
-            " pm",
-        ]
-    ) and hora < 12:
+    # Detectar periodo del día.
+    es_manana = "de la manana" in texto_n
+    es_tarde = "de la tarde" in texto_n
+    es_noche = "de la noche" in texto_n
+    es_madrugada = "de la madrugada" in texto_n
+
+    # Conversión a formato de 24 horas.
+    if es_tarde and 1 <= hora <= 11:
         hora += 12
 
-    if (
-        "de la manana" in texto_n
-        and hora == 12
-    ):
+    elif es_noche and 1 <= hora <= 11:
+        hora += 12
+
+    elif es_madrugada:
+        # 12 de la madrugada = 00:00.
+        # 1 a 5 de la madrugada permanecen en formato AM.
+        if hora == 12:
+            hora = 0
+
+    elif es_manana:
+        # 12 de la mañana se interpreta como mediodía.
+        if hora == 12:
+            hora = 12
+
+    # También aceptar PM explícito.
+    elif re.search(r"\bpm\b", texto_n) and 1 <= hora <= 11:
+        hora += 12
+
+    # AM explícito: 12 AM = 00:00.
+    elif re.search(r"\bam\b", texto_n) and hora == 12:
         hora = 0
 
     if hora > 23 or minuto > 59:
         return None
 
     return f"{hora:02d}:{minuto:02d}"
-
 
 def parsear_fecha(texto: str) -> str:
     texto_n = normalizar(texto)
@@ -1543,42 +1615,68 @@ def parsear_fecha(texto: str) -> str:
 def extraer_nombre_medicamento_agregar(
     texto: str,
 ) -> str:
-    texto_n = corregir_transcripcion_comandos(
-        texto
-    )
+    """
+    Extrae solo el nombre del medicamento, incluso con frases como:
+    "a agregar medicamento aspirina, alas ocho".
+    """
+    texto_n = corregir_transcripcion_comandos(texto)
+    texto_n = normalizar(texto_n)
 
+    texto_n = re.sub(r"[,.;:!?]", " ", texto_n)
+    texto_n = re.sub(r"\balas\b", "a las", texto_n)
+    texto_n = re.sub(r"\s+", " ", texto_n).strip()
+
+    # Eliminar muletillas y verbos repetidos al inicio.
     texto_n = re.sub(
-        r"^(agregar|agrega|anadir|anade|registrar|registra|programar|programa)\s+",
+        r"^(?:a\s+)?(?:(?:agregar|agrega|anadir|anade|registrar|registra|programar|programa)\s+)+",
         "",
         texto_n,
     )
 
     texto_n = re.sub(
-        r"\b(medicamento|medicina|pastilla)\b",
-        "",
+        r"\b(?:medicamento|medicina|pastilla)\b",
+        " ",
         texto_n,
+        count=1,
     )
 
     texto_n = re.sub(
-        r"\b(me|mi|he|comiendo|comido|quiero|por favor)\b",
+        r"\b(?:me|mi|he|comiendo|comido|quiero|por favor)\b",
         " ",
         texto_n,
     )
 
+    # Cortar antes de la hora.
     texto_n = re.split(
-        r"\b(?:a las|las)\b",
+        r"\b(?:a\s+las|las)\b",
         texto_n,
         maxsplit=1,
     )[0]
 
+    # Si Whisper omitió "a las", retirar una hora final escrita con palabra.
     texto_n = re.sub(
-        r"\b(dosis|debo tomar|tomar)\b.*$",
+        r"\b(?:una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)"
+        r"(?:\s+de\s+la\s+(?:manana|tarde|noche|madrugada))?\s*$",
         "",
         texto_n,
     )
 
-    return texto_n.strip().title()
+    texto_n = re.sub(
+        r"\b(?:dosis|debo tomar|tomar)\b.*$",
+        "",
+        texto_n,
+    )
 
+    # Quitar verbos residuales que puedan quedar por una repetición.
+    texto_n = re.sub(
+        r"\b(?:agregar|agrega|anadir|registrar|programar)\b",
+        " ",
+        texto_n,
+    )
+
+    texto_n = re.sub(r"\s+", " ", texto_n).strip()
+
+    return texto_n.title()
 
 def extraer_nombre_medicamento_quitar(
     texto: str,
