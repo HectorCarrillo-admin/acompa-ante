@@ -5,6 +5,7 @@ Asistente 100% por voz para adultos mayores con dificultad visual
 import os, re, asyncio, sqlite3, tempfile, logging
 from datetime import datetime, date, timedelta
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import requests
 import nest_asyncio
@@ -22,6 +23,19 @@ from telegram.ext import (
 nest_asyncio.apply()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Zona horaria oficial usada por el bot.
+ZONA_HORARIA = ZoneInfo("America/Bogota")
+
+
+def ahora_local() -> datetime:
+    """Devuelve la fecha y hora actual de Colombia."""
+    return datetime.now(ZONA_HORARIA)
+
+
+def hoy_local() -> date:
+    """Devuelve la fecha actual de Colombia."""
+    return ahora_local().date()
 
 # ══════════════════════════════════════════════════════════════
 # CONFIGURACIÓN — variables de entorno (se definen en Railway)
@@ -89,8 +103,8 @@ def hablar(texto: str) -> str:
         return None
 
 def saludo_hora() -> str:
-    h = datetime.now().hour
-    t = datetime.now().strftime("%I:%M %p")
+    h = ahora_local().hour
+    t = ahora_local().strftime("%I:%M %p")
     n = CONFIG["nombre"]
     if h < 12:   return f"Buenos dias {n}. Son las {t}."
     elif h < 18: return f"Buenas tardes {n}. Son las {t}."
@@ -154,13 +168,13 @@ def add_med(nombre, dosis, hora):
 def ya_tomado(med_id, hora_prog):
     con = get_db()
     r = con.execute("SELECT tomado FROM tomas WHERE med_id=? AND fecha=? AND hora_prog=?",
-                    (med_id, date.today().isoformat(), hora_prog)).fetchone()
+                    (med_id, hoy_local().isoformat(), hora_prog)).fetchone()
     con.close(); return bool(r and r["tomado"])
 
 def marcar_tomado(med_id, hora_prog):
     con = get_db()
-    hoy = date.today().isoformat()
-    ahora = datetime.now().strftime("%H:%M")
+    hoy = hoy_local().isoformat()
+    ahora = ahora_local().strftime("%H:%M")
     ex = con.execute("SELECT id FROM tomas WHERE med_id=? AND fecha=? AND hora_prog=?",
                      (med_id, hoy, hora_prog)).fetchone()
     if ex:
@@ -195,7 +209,7 @@ def buscar_contacto(nb):
     return None
 
 def get_agenda(fecha=None):
-    con = get_db(); f = fecha or date.today().isoformat()
+    con = get_db(); f = fecha or hoy_local().isoformat()
     rows = [dict(r) for r in con.execute(
         "SELECT * FROM agenda WHERE fecha=? ORDER BY hora", (f,)).fetchall()]
     con.close(); return rows
@@ -283,7 +297,7 @@ def disparar_alarma_sync(med_id: int, chat_id: int):
         llamar(CONFIG["telefono_usuario"], msg_voz)
     scheduler.add_job(
         recordatorio_familiar_sync, "date",
-        run_date=datetime.now() + timedelta(minutes=15),
+        run_date=ahora_local() + timedelta(minutes=15),
         args=[med_id, med["hora"], med["nombre"], chat_id],
         id=f"rec_{med_id}", replace_existing=True)
 
@@ -342,7 +356,7 @@ def sincronizar_alarmas(chat_id: int):
 # CEREBRO DE COMANDOS DE VOZ
 # ══════════════════════════════════════════════════════════════
 def parsear_fecha(texto):
-    hoy = date.today(); t = texto.lower()
+    hoy = hoy_local(); t = texto.lower()
     t = t.replace("manana", "mañana").replace("sabado", "sábado").replace("miercoles", "miércoles")
     if "pasado" in t and "mañana" in t: return (hoy + timedelta(days=2)).isoformat()
     if "mañana" in t: return (hoy + timedelta(days=1)).isoformat()
@@ -401,9 +415,9 @@ def procesar_comando(texto: str, chat_id=None) -> str:
     if any(p in t for p in ["agenda","cita","que tengo","plan del dia","que hay"]) and \
        not any(p in t for p in ["agendame","programa","anota","recuerdame"]):
         if "mañana" in t or "manana" in t:
-            f = (date.today() + timedelta(days=1)).isoformat(); periodo = "manana"
+            f = (hoy_local() + timedelta(days=1)).isoformat(); periodo = "manana"
         else:
-            f = date.today().isoformat(); periodo = "hoy"
+            f = hoy_local().isoformat(); periodo = "hoy"
         eventos = get_agenda(f); meds = get_meds() if periodo == "hoy" else []
         partes = [f"{nombre}, tu agenda para {periodo}:"]
         if eventos:
@@ -425,8 +439,8 @@ def procesar_comando(texto: str, chat_id=None) -> str:
         desc = " ".join(desc.split()).title()
         if len(desc) > 2:
             add_agenda(fecha, hora, desc)
-            hoy_iso = date.today().isoformat()
-            man_iso = (date.today() + timedelta(days=1)).isoformat()
+            hoy_iso = hoy_local().isoformat()
+            man_iso = (hoy_local() + timedelta(days=1)).isoformat()
             fl = "hoy" if fecha == hoy_iso else ("manana" if fecha == man_iso else fecha)
             return f"Listo. Agende {desc} para {fl} a las {hora}."
         return "No entendi el evento. Di: agendame cita con el medico para manana a las tres de la tarde."
@@ -480,8 +494,8 @@ def procesar_comando(texto: str, chat_id=None) -> str:
         return "Di: glucosa 95."
 
     # Hora / fecha
-    if any(p in t for p in ["hora","que hora"]): return f"Son las {datetime.now().strftime('%I:%M %p')}."
-    if any(p in t for p in ["fecha","que dia","hoy es"]): return f"Hoy es {datetime.now().strftime('%A %d de %B de %Y')}."
+    if any(p in t for p in ["hora","que hora"]): return f"Son las {ahora_local().strftime('%I:%M %p')}."
+    if any(p in t for p in ["fecha","que dia","hoy es"]): return f"Hoy es {ahora_local().strftime('%A %d de %B de %Y')}."
 
     # Ayuda
     if any(p in t for p in ["ayuda","que puedo","comandos","instrucciones"]):
