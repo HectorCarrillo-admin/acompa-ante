@@ -1,7 +1,0 @@
-python-telegram-bot==20.7
-gtts==2.5.1
-faster-whisper==1.1.1
-apscheduler==3.10.4
-twilio==8.10.0
-requests==2.31.0
-nest-asyncio==1.6.0
