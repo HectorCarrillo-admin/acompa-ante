@@ -42,6 +42,22 @@ MODO_LLAMADAS = bool(CONFIG["twilio_sid"] and CONFIG["twilio_token"] and CONFIG[
 MODO_WHATSAPP = bool(CONFIG["callmebot_phone"] and CONFIG["callmebot_key"])
 FAMILIAR_ID   = int(CONFIG["familiar_chat_id"]) if CONFIG["familiar_chat_id"] else None
 
+# Usuarios autorizados separados por comas en Railway.
+# Ejemplo: 1532627802,1876543210
+USUARIOS_AUTORIZADOS = set()
+
+for chat_id in os.environ.get("USUARIOS_AUTORIZADOS", "").split(","):
+    chat_id = chat_id.strip()
+    if not chat_id:
+        continue
+    try:
+        USUARIOS_AUTORIZADOS.add(int(chat_id))
+    except ValueError:
+        logger.warning(
+            "Chat ID inválido ignorado en USUARIOS_AUTORIZADOS: %s",
+            chat_id
+        )
+
 # ══════════════════════════════════════════════════════════════
 # VOZ — Whisper (STT) + gTTS (TTS)
 # ══════════════════════════════════════════════════════════════
@@ -484,6 +500,21 @@ def procesar_comando(texto: str, chat_id=None) -> str:
 # ══════════════════════════════════════════════════════════════
 # HANDLERS DE TELEGRAM
 # ══════════════════════════════════════════════════════════════
+
+def usuario_autorizado(update: Update) -> bool:
+    """Comprueba si el chat actual está autorizado."""
+    chat = update.effective_chat
+    return bool(chat and chat.id in USUARIOS_AUTORIZADOS)
+
+
+def mensaje_no_autorizado(chat_id: int) -> str:
+    """Mensaje que recibe un usuario todavía no autorizado."""
+    return (
+        "Todavía no estás autorizado para utilizar este asistente.\n\n"
+        f"Tu Chat ID es:\n{chat_id}\n\n"
+        "Envía este número al administrador para solicitar acceso."
+    )
+
 MENU = ReplyKeyboardMarkup(
     [["Mis medicamentos"],
      ["Mi agenda de hoy"],
@@ -493,14 +524,32 @@ MENU = ReplyKeyboardMarkup(
 )
 
 async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Comando universal: cualquier persona puede consultar su Chat ID.
+    Esto no le da acceso a las demás funciones del bot.
+    """
     chat_id = update.effective_chat.id
 
+    if chat_id in USUARIOS_AUTORIZADOS:
+        estado = "Tu acceso ya está autorizado."
+    else:
+        estado = (
+            "Tu acceso todavía no está autorizado. "
+            "Envía este número al administrador."
+        )
+
     await update.message.reply_text(
-        f"Tu chat ID es:\n\n{chat_id}\n\n"
-        "Guarda este número para configurar el acceso autorizado."
+        f"Tu Chat ID es:\n\n{chat_id}\n\n{estado}"
     )
 
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not usuario_autorizado(update):
+        await update.message.reply_text(
+            mensaje_no_autorizado(update.effective_chat.id)
+        )
+        return
+
     chat_id = update.effective_chat.id
     sincronizar_alarmas(chat_id)
     scheduler.add_job(agenda_matutina_sync, CronTrigger(hour=8, minute=0),
@@ -519,6 +568,12 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         with open(audio, "rb") as f: await update.message.reply_voice(voice=f)
 
 async def manejar_voz(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not usuario_autorizado(update):
+        await update.message.reply_text(
+            mensaje_no_autorizado(update.effective_chat.id)
+        )
+        return
+
     chat_id = update.effective_chat.id
     await update.message.reply_text("Escuchando...")
     voz = update.message.voice or update.message.audio
@@ -543,6 +598,12 @@ async def manejar_voz(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except: pass
 
 async def manejar_texto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not usuario_autorizado(update):
+        await update.message.reply_text(
+            mensaje_no_autorizado(update.effective_chat.id)
+        )
+        return
+
     chat_id = update.effective_chat.id
     texto = update.message.text
     mapa = {
@@ -560,6 +621,14 @@ async def manejar_texto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def manejar_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+
+    if not usuario_autorizado(update):
+        await query.answer(
+            "No tienes autorización para utilizar este bot.",
+            show_alert=True
+        )
+        return
+
     await query.answer()
     data = query.data
     if data.startswith("tomado_"):
@@ -584,14 +653,30 @@ async def manejar_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # ══════════════════════════════════════════════════════════════
 def main():
+    if not CONFIG["telegram_token"]:
+        raise RuntimeError(
+            "Falta configurar TELEGRAM_TOKEN en Railway."
+        )
+
+    if not USUARIOS_AUTORIZADOS:
+        logger.warning(
+            "USUARIOS_AUTORIZADOS está vacío. "
+            "Solo el comando /id estará disponible."
+        )
+    else:
+        logger.info(
+            "Usuarios autorizados cargados: %s",
+            len(USUARIOS_AUTORIZADOS)
+        )
+
     iniciar_db()
     scheduler.start()
     logger.info("Motor de alarmas iniciado")
 
     app = Application.builder().token(CONFIG["telegram_token"]).build()
+    app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu",  cmd_start))
-    app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, manejar_voz))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manejar_texto))
     app.add_handler(CallbackQueryHandler(manejar_callback))
