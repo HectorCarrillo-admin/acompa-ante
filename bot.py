@@ -1,71 +1,87 @@
 """
 Acompañante Mayor — Bot de Telegram para Railway
 
-Funciones principales:
-- Acceso controlado por Chat ID.
-- /id universal para conocer el identificador del usuario.
-- Medicamentos: agregar, quitar, listar y confirmar tomas diarias.
-- Alarmas automáticas a la hora programada.
+Características:
+- Base de datos inicialmente vacía.
+- Medicamentos: agregar, quitar, consultar y registrar tomas diarias.
+- Alarmas automáticas con botón de confirmación.
 - Agenda: agregar, quitar y consultar eventos.
-- Contactos: agregar, quitar, consultar y marcar contacto de emergencia.
-- Noticias en texto y audio mediante RSS.
-- Entrada por texto o mensaje de voz.
+- Contactos: agregar, quitar, consultar y marcar emergencia.
+- Noticias por RSS, en texto y audio.
+- Entrada por texto o voz.
 - Respuestas en texto y audio.
+- Control de acceso por Chat ID.
+- Zona horaria configurable, por defecto America/Bogota.
 
-Variables de entorno recomendadas en Railway:
-- TELEGRAM_TOKEN              Obligatoria.
-- USUARIOS_AUTORIZADOS        IDs separados por comas.
-- NOMBRE_USUARIO              Nombre del adulto mayor.
+Variables de entorno:
+OBLIGATORIAS
+- TELEGRAM_TOKEN
+- USUARIOS_AUTORIZADOS        Ejemplo: 1532627802,1876543210
+
+RECOMENDADAS
+- NOMBRE_USUARIO              Ejemplo: Nubia
 - DB_PATH                     /data/acompanante.db
 - ZONA_HORARIA                America/Bogota
-- RSS_NOTICIAS                URL RSS opcional.
-- FAMILIAR_CHAT_ID            ID opcional para alertas.
-- TWILIO_SID                  Opcional.
-- TWILIO_TOKEN                Opcional.
-- TWILIO_NUMERO               Opcional.
-- TELEFONO_USUARIO            Opcional.
-- CALLMEBOT_PHONE             Opcional.
-- CALLMEBOT_KEY               Opcional.
+- MODELO_VOZ                  base
+- WHISPER_CPU_THREADS         2
+- WHISPER_BEAM_SIZE           3
 
-El directorio /data debe montarse como volumen persistente en Railway.
+OPCIONALES
+- USUARIOS_ALARMA             IDs que reciben alarmas. Si está vacío, usa USUARIOS_AUTORIZADOS.
+- FAMILIAR_CHAT_ID            Recibe aviso si no se confirma una toma.
+- RSS_NOTICIAS                Feed RSS.
+- TWILIO_SID
+- TWILIO_TOKEN
+- TWILIO_NUMERO
+- TELEFONO_USUARIO
+- CALLMEBOT_PHONE
+- CALLMEBOT_KEY
+
+Railway:
+- Montar un volumen persistente en /data.
+- El Dockerfile debe incluir ffmpeg.
 """
 
+from __future__ import annotations
+
+import asyncio
+import html
+import logging
 import os
 import re
-import html
-import asyncio
 import sqlite3
-import tempfile
-import logging
-import unicodedata
 import subprocess
-from difflib import SequenceMatcher, get_close_matches
+import tempfile
+import unicodedata
 import xml.etree.ElementTree as ET
-from datetime import datetime, date, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Iterable
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
-import requests
 import nest_asyncio
-from gtts import gTTS
+import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from faster_whisper import WhisperModel
+from gtts import gTTS
 from telegram import (
-    Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
+    Update,
 )
 from telegram.ext import (
     Application,
-    CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
-
-from faster_whisper import WhisperModel
 
 nest_asyncio.apply()
 
@@ -79,41 +95,57 @@ logger = logging.getLogger("acompanante_mayor")
 # ══════════════════════════════════════════════════════════════
 # CONFIGURACIÓN
 # ══════════════════════════════════════════════════════════════
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
-NOMBRE_USUARIO = os.environ.get("NOMBRE_USUARIO", "Abuelo").strip()
-DB_PATH = os.environ.get("DB_PATH", "/data/acompanante.db").strip()
-ZONA_HORARIA_NOMBRE = os.environ.get(
-    "ZONA_HORARIA",
-    "America/Bogota",
-).strip()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+NOMBRE_USUARIO = os.getenv("NOMBRE_USUARIO", "Usuario").strip()
+DB_PATH = os.getenv("DB_PATH", "/data/acompanante.db").strip()
+ZONA_HORARIA_NOMBRE = os.getenv("ZONA_HORARIA", "America/Bogota").strip()
 
-RSS_NOTICIAS = os.environ.get(
+MODELO_VOZ = os.getenv("MODELO_VOZ", "base").strip()
+WHISPER_CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", "2"))
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "3"))
+
+RSS_NOTICIAS = os.getenv(
     "RSS_NOTICIAS",
     "https://news.google.com/rss?hl=es-419&gl=CO&ceid=CO:es-419",
 ).strip()
 
-FAMILIAR_CHAT_ID_RAW = os.environ.get("FAMILIAR_CHAT_ID", "").strip()
-TELEFONO_USUARIO = os.environ.get("TELEFONO_USUARIO", "").strip()
+FAMILIAR_CHAT_ID_RAW = os.getenv("FAMILIAR_CHAT_ID", "").strip()
 
-TWILIO_SID = os.environ.get("TWILIO_SID", "").strip()
-TWILIO_TOKEN = os.environ.get("TWILIO_TOKEN", "").strip()
-TWILIO_NUMERO = os.environ.get("TWILIO_NUMERO", "").strip()
+TWILIO_SID = os.getenv("TWILIO_SID", "").strip()
+TWILIO_TOKEN = os.getenv("TWILIO_TOKEN", "").strip()
+TWILIO_NUMERO = os.getenv("TWILIO_NUMERO", "").strip()
+TELEFONO_USUARIO = os.getenv("TELEFONO_USUARIO", "").strip()
 
-CALLMEBOT_PHONE = os.environ.get("CALLMEBOT_PHONE", "").strip()
-CALLMEBOT_KEY = os.environ.get("CALLMEBOT_KEY", "").strip()
+CALLMEBOT_PHONE = os.getenv("CALLMEBOT_PHONE", "").strip()
+CALLMEBOT_KEY = os.getenv("CALLMEBOT_KEY", "").strip()
 
-MODELO_VOZ = os.environ.get("MODELO_VOZ", "base").strip()
-WHISPER_BEAM_SIZE = int(os.environ.get("WHISPER_BEAM_SIZE", "3"))
-WHISPER_CPU_THREADS = int(os.environ.get("WHISPER_CPU_THREADS", "2"))
 
-try:
-    ZONA_HORARIA = ZoneInfo(ZONA_HORARIA_NOMBRE)
-except Exception:
-    logger.warning(
-        "Zona horaria inválida '%s'. Se usará America/Bogota.",
-        ZONA_HORARIA_NOMBRE,
-    )
-    ZONA_HORARIA = ZoneInfo("America/Bogota")
+def parsear_ids(valor: str) -> set[int]:
+    resultado: set[int] = set()
+
+    for fragmento in valor.split(","):
+        fragmento = fragmento.strip()
+
+        if not fragmento:
+            continue
+
+        try:
+            resultado.add(int(fragmento))
+        except ValueError:
+            logger.warning("Chat ID inválido ignorado: %s", fragmento)
+
+    return resultado
+
+
+USUARIOS_AUTORIZADOS = parsear_ids(
+    os.getenv("USUARIOS_AUTORIZADOS", "")
+)
+
+USUARIOS_ALARMA = parsear_ids(
+    os.getenv("USUARIOS_ALARMA", "")
+)
+if not USUARIOS_ALARMA:
+    USUARIOS_ALARMA = set(USUARIOS_AUTORIZADOS)
 
 try:
     FAMILIAR_CHAT_ID = (
@@ -125,28 +157,15 @@ except ValueError:
     FAMILIAR_CHAT_ID = None
     logger.warning("FAMILIAR_CHAT_ID no es válido.")
 
-
-def cargar_usuarios_autorizados() -> set[int]:
-    usuarios: set[int] = set()
-    valor = os.environ.get("USUARIOS_AUTORIZADOS", "")
-
-    for fragmento in valor.split(","):
-        fragmento = fragmento.strip()
-        if not fragmento:
-            continue
-
-        try:
-            usuarios.add(int(fragmento))
-        except ValueError:
-            logger.warning(
-                "Chat ID inválido ignorado: %s",
-                fragmento,
-            )
-
-    return usuarios
-
-
-USUARIOS_AUTORIZADOS = cargar_usuarios_autorizados()
+try:
+    ZONA_HORARIA = ZoneInfo(ZONA_HORARIA_NOMBRE)
+except Exception:
+    logger.warning(
+        "Zona horaria inválida '%s'. Se usará America/Bogota.",
+        ZONA_HORARIA_NOMBRE,
+    )
+    ZONA_HORARIA_NOMBRE = "America/Bogota"
+    ZONA_HORARIA = ZoneInfo(ZONA_HORARIA_NOMBRE)
 
 
 def ahora_local() -> datetime:
@@ -168,15 +187,29 @@ def normalizar(texto: str) -> str:
     return texto
 
 
+def texto_sin_puntuacion(texto: str) -> str:
+    texto = normalizar(texto)
+    texto = re.sub(r"[,.;:!?¡¿]", " ", texto)
+    texto = re.sub(r"\s+", " ", texto).strip()
+    texto = texto.replace("madrugrada", "madrugada")
+    texto = texto.replace("madrujada", "madrugada")
+    texto = re.sub(r"\balas\b", "a las", texto)
+    texto = re.sub(
+        r"\ba la\s+(?=\d|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)",
+        "a las ",
+        texto,
+    )
+    return texto
+
+
 # ══════════════════════════════════════════════════════════════
-# VOZ — faster-whisper optimizado para CPU
+# VOZ
 # ══════════════════════════════════════════════════════════════
-VOCABULARIO_CONTEXTO = (
+VOCABULARIO_VOZ = (
     "Acompañante Mayor. Comandos frecuentes: agregar medicamento, "
-    "quitar medicamento, medicina, pastilla, Aspirina, Metformina, "
-    "Losartán, Omeprazol, Vitamina D, ya tomé, registrar toma, "
-    "agenda, agregar cita, quitar evento, contacto, teléfono, "
-    "emergencia, noticias, mañana, hoy, ocho, nueve, diez."
+    "quitar medicamento, mis medicamentos, ya tomé, Aspirina, "
+    "Metformina, Losartán, Omeprazol, Vitamina D, agenda, cita, "
+    "contacto, emergencia, noticias, mañana, tarde, noche, madrugada."
 )
 
 print(f"Cargando modelo de voz '{MODELO_VOZ}'...")
@@ -190,169 +223,76 @@ MODELO_WHISPER = WhisperModel(
 print("Modelo de voz listo")
 
 
-def convertir_audio_para_whisper(
-    ruta_origen: str,
-) -> str | None:
-    """
-    Convierte el audio de Telegram a WAV mono de 16 kHz.
-    Esto mejora la precisión y reduce trabajo innecesario.
-    """
-    archivo = tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=".wav",
-    )
-    archivo.close()
+def eliminar_temporal(ruta: str | None) -> None:
+    if not ruta:
+        return
 
-    comando = [
-        "ffmpeg",
-        "-y",
-        "-loglevel",
-        "error",
-        "-i",
-        ruta_origen,
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "-vn",
-        archivo.name,
-    ]
+    try:
+        Path(ruta).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def convertir_audio(ruta_origen: str) -> str | None:
+    archivo = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    archivo.close()
 
     try:
         subprocess.run(
-            comando,
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-i",
+                ruta_origen,
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-vn",
+                archivo.name,
+            ],
             check=True,
             timeout=30,
         )
         return archivo.name
     except Exception as error:
-        logger.exception(
-            "No se pudo convertir el audio con ffmpeg: %s",
-            error,
-        )
+        logger.exception("Error al convertir audio: %s", error)
         eliminar_temporal(archivo.name)
         return None
 
 
-def corregir_transcripcion_comandos(texto: str) -> str:
-    """
-    Corrige errores frecuentes de reconocimiento sin alterar nombres
-    propios ni números de forma agresiva.
-    """
-    texto_n = normalizar(texto)
+def corregir_errores_voz(texto: str) -> str:
+    texto = texto_sin_puntuacion(texto)
 
-    reemplazos_frases = {
-        "me he comiendo": "medicamento",
-        "me comiendo": "medicamento",
-        "me he comido": "medicamento",
-        "medicamento aspirina": "medicamento aspirina",
+    reemplazos = {
         "abregar": "agregar",
+        "agragar": "agregar",
         "agregarme": "agregar",
-        "agrégame": "agregar",
         "anotar medicamento": "agregar medicamento",
         "programar medicamento": "agregar medicamento",
-        "borrar medicina": "quitar medicamento",
-        "eliminar medicina": "quitar medicamento",
+        "me he comiendo": "medicamento",
+        "me comiendo": "medicamento",
+        "mis medicamento": "mis medicamentos",
+        "mis contacto": "mis contactos",
         "quite medicamento": "quitar medicamento",
-        "ya tome": "ya tome",
-        "ya me tome": "ya me tome",
-        "registra que tome": "registrar toma",
     }
 
-    for origen, destino in reemplazos_frases.items():
-        texto_n = texto_n.replace(origen, destino)
+    for origen, destino in reemplazos.items():
+        texto = texto.replace(origen, destino)
 
-    palabras_clave = {
-        "agregar": [
-            "agregar",
-            "agrega",
-            "abregar",
-            "agragar",
-            "agregarme",
-            "anadir",
-            "registrar",
-            "programar",
-        ],
-        "quitar": [
-            "quitar",
-            "quita",
-            "eliminar",
-            "elimina",
-            "borrar",
-            "borra",
-        ],
-        "medicamento": [
-            "medicamento",
-            "medicamentos",
-            "medicina",
-            "medicinas",
-            "pastilla",
-            "pastillas",
-        ],
-        "contacto": [
-            "contacto",
-            "contactos",
-            "telefono",
-        ],
-        "evento": [
-            "evento",
-            "eventos",
-            "cita",
-            "citas",
-            "agenda",
-        ],
-        "noticias": [
-            "noticia",
-            "noticias",
-        ],
-    }
-
-    tokens = texto_n.split()
-    corregidos = []
-
-    for token in tokens:
-        token_limpio = re.sub(r"[^a-z0-9+]", "", token)
-
-        if len(token_limpio) < 4:
-            corregidos.append(token)
-            continue
-
-        mejor_canonica = None
-        mejor_puntaje = 0.0
-
-        for canonica, variantes in palabras_clave.items():
-            for variante in variantes:
-                puntaje = SequenceMatcher(
-                    None,
-                    token_limpio,
-                    variante,
-                ).ratio()
-
-                if puntaje > mejor_puntaje:
-                    mejor_puntaje = puntaje
-                    mejor_canonica = canonica
-
-        if mejor_canonica and mejor_puntaje >= 0.82:
-            corregidos.append(mejor_canonica)
-        else:
-            corregidos.append(token)
-
-    return " ".join(corregidos)
+    return texto
 
 
 def transcribir_audio(ruta_audio: str) -> str:
-    if not ruta_audio or not os.path.exists(ruta_audio):
-        return ""
-
-    ruta_wav = convertir_audio_para_whisper(
-        ruta_audio
-    )
+    ruta_wav = convertir_audio(ruta_audio)
 
     if not ruta_wav:
         return ""
 
     try:
-        segmentos, informacion = MODELO_WHISPER.transcribe(
+        segmentos, _ = MODELO_WHISPER.transcribe(
             ruta_wav,
             language="es",
             beam_size=WHISPER_BEAM_SIZE,
@@ -363,7 +303,7 @@ def transcribir_audio(ruta_audio: str) -> str:
                 "speech_pad_ms": 200,
             },
             condition_on_previous_text=False,
-            initial_prompt=VOCABULARIO_CONTEXTO,
+            initial_prompt=VOCABULARIO_VOZ,
             temperature=0.0,
         )
 
@@ -373,86 +313,55 @@ def transcribir_audio(ruta_audio: str) -> str:
             if segmento.text.strip()
         ).strip()
 
-        texto_corregido = corregir_transcripcion_comandos(
-            texto
-        )
+        corregido = corregir_errores_voz(texto)
 
-        logger.info(
-            'Transcripción original: "%s"',
-            texto,
-        )
-        logger.info(
-            'Transcripción corregida: "%s"',
-            texto_corregido,
-        )
+        logger.info('Transcripción original: "%s"', texto)
+        logger.info('Transcripción corregida: "%s"', corregido)
 
-        return texto_corregido
+        return corregido
     except Exception as error:
-        logger.exception(
-            "Error al transcribir con faster-whisper: %s",
-            error,
-        )
+        logger.exception("Error al transcribir audio: %s", error)
         return ""
     finally:
         eliminar_temporal(ruta_wav)
 
 
 def crear_audio(texto: str) -> str | None:
+    archivo = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+    archivo.close()
+
     try:
-        archivo = tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=".mp3",
-        )
-        archivo.close()
-
-        gTTS(
-            text=texto,
-            lang="es",
-            slow=False,
-        ).save(archivo.name)
-
+        gTTS(text=texto, lang="es", slow=False).save(archivo.name)
         return archivo.name
     except Exception as error:
-        logger.exception("Error de gTTS: %s", error)
+        logger.exception("Error al crear audio: %s", error)
+        eliminar_temporal(archivo.name)
         return None
 
 
-def eliminar_temporal(ruta: str | None) -> None:
-    if not ruta:
-        return
-
-    try:
-        if os.path.exists(ruta):
-            os.remove(ruta)
-    except OSError:
-        pass
-
-
-async def responder_con_audio(
+async def responder(
     update: Update,
     texto: str,
     reply_markup=None,
+    con_audio: bool = True,
 ) -> None:
     if not update.message:
         return
 
-    # La respuesta escrita sale primero para reducir la espera percibida.
     await update.message.reply_text(
         texto,
         reply_markup=reply_markup,
     )
 
-    audio = await asyncio.to_thread(
-        crear_audio,
-        texto,
-    )
+    if not con_audio:
+        return
+
+    audio = await asyncio.to_thread(crear_audio, texto)
 
     try:
         if audio:
             with open(audio, "rb") as archivo:
-                await update.message.reply_voice(
-                    voice=archivo
-                )
+                await update.message.reply_voice(voice=archivo)
     finally:
         eliminar_temporal(audio)
 
@@ -460,9 +369,7 @@ async def responder_con_audio(
 # ══════════════════════════════════════════════════════════════
 # BASE DE DATOS
 # ══════════════════════════════════════════════════════════════
-directorio_db = os.path.dirname(DB_PATH)
-if directorio_db:
-    os.makedirs(directorio_db, exist_ok=True)
+Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 
 def conectar_db() -> sqlite3.Connection:
@@ -485,7 +392,7 @@ def iniciar_db() -> None:
             creado_en TEXT NOT NULL
         );
 
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_medicamento_nombre_activo
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_medicamento_activo
         ON medicamentos(nombre)
         WHERE activo = 1;
 
@@ -525,6 +432,134 @@ def iniciar_db() -> None:
 
 
 # ══════════════════════════════════════════════════════════════
+# HORAS Y FECHAS
+# ══════════════════════════════════════════════════════════════
+NUMEROS_HORA = {
+    "una": 1,
+    "dos": 2,
+    "tres": 3,
+    "cuatro": 4,
+    "cinco": 5,
+    "seis": 6,
+    "siete": 7,
+    "ocho": 8,
+    "nueve": 9,
+    "diez": 10,
+    "once": 11,
+    "doce": 12,
+}
+
+
+def parsear_hora(texto: str) -> str | None:
+    texto = texto_sin_puntuacion(texto)
+
+    coincidencia = re.search(
+        r"\b([01]?\d|2[0-3])\s*[:h]\s*([0-5]\d)\b",
+        texto,
+    )
+
+    if coincidencia:
+        return (
+            f"{int(coincidencia.group(1)):02d}:"
+            f"{int(coincidencia.group(2)):02d}"
+        )
+
+    coincidencia = re.search(
+        r"\b(?:a\s+las|las)\s+(\d{1,2})(?:\s+y\s+(\d{1,2}))?\b",
+        texto,
+    )
+
+    hora: int | None = None
+    minuto = 0
+
+    if coincidencia:
+        hora = int(coincidencia.group(1))
+        minuto = int(coincidencia.group(2) or 0)
+    else:
+        for palabra, valor in NUMEROS_HORA.items():
+            if re.search(
+                rf"\b(?:a\s+las|las)\s+{palabra}\b",
+                texto,
+            ):
+                hora = valor
+                break
+
+        if hora is None:
+            for palabra, valor in NUMEROS_HORA.items():
+                if re.search(
+                    rf"\b{palabra}\b"
+                    rf"(?:\s+de\s+la\s+(?:manana|tarde|noche|madrugada))?"
+                    rf"\s*$",
+                    texto,
+                ):
+                    hora = valor
+                    break
+
+    if hora is None:
+        return None
+
+    if "media" in texto:
+        minuto = 30
+    elif "cuarto" in texto:
+        minuto = 15
+
+    if "de la tarde" in texto and 1 <= hora <= 11:
+        hora += 12
+    elif "de la noche" in texto and 1 <= hora <= 11:
+        hora += 12
+    elif "de la madrugada" in texto and hora == 12:
+        hora = 0
+    elif re.search(r"\bpm\b", texto) and 1 <= hora <= 11:
+        hora += 12
+    elif re.search(r"\bam\b", texto) and hora == 12:
+        hora = 0
+
+    if hora > 23 or minuto > 59:
+        return None
+
+    return f"{hora:02d}:{minuto:02d}"
+
+
+def parsear_fecha(texto: str) -> str:
+    texto = texto_sin_puntuacion(texto)
+    hoy = hoy_local()
+
+    coincidencia = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", texto)
+    if coincidencia:
+        return coincidencia.group(1)
+
+    if "pasado manana" in texto:
+        return (hoy + timedelta(days=2)).isoformat()
+
+    if "manana" in texto:
+        return (hoy + timedelta(days=1)).isoformat()
+
+    if "hoy" in texto:
+        return hoy.isoformat()
+
+    dias = {
+        "lunes": 0,
+        "martes": 1,
+        "miercoles": 2,
+        "jueves": 3,
+        "viernes": 4,
+        "sabado": 5,
+        "domingo": 6,
+    }
+
+    for nombre, numero in dias.items():
+        if nombre in texto:
+            diferencia = (numero - hoy.weekday()) % 7
+
+            if diferencia == 0:
+                diferencia = 7
+
+            return (hoy + timedelta(days=diferencia)).isoformat()
+
+    return hoy.isoformat()
+
+
+# ══════════════════════════════════════════════════════════════
 # MEDICAMENTOS
 # ══════════════════════════════════════════════════════════════
 def listar_medicamentos() -> list[dict]:
@@ -556,22 +591,32 @@ def buscar_medicamento(nombre: str) -> dict | None:
     return None
 
 
+def medicamento_tomado_hoy(medicamento_id: int) -> bool:
+    conexion = conectar_db()
+    fila = conexion.execute(
+        """
+        SELECT id
+        FROM tomas
+        WHERE medicamento_id = ? AND fecha = ?
+        """,
+        (medicamento_id, hoy_local().isoformat()),
+    ).fetchone()
+    conexion.close()
+    return fila is not None
+
+
 def agregar_medicamento(
     nombre: str,
     hora: str,
     dosis: str = "",
-) -> tuple[bool, str]:
+) -> str:
     nombre = nombre.strip().title()
     dosis = dosis.strip()
 
     if not nombre:
-        return False, "Falta el nombre del medicamento."
-
-    if not validar_hora(hora):
-        return False, "La hora no es válida."
+        return "No pude identificar el nombre del medicamento."
 
     conexion = conectar_db()
-
     existente = conexion.execute(
         """
         SELECT id
@@ -583,10 +628,7 @@ def agregar_medicamento(
 
     if existente:
         conexion.close()
-        return (
-            False,
-            f"{nombre} ya está registrado.",
-        )
+        return f"{nombre} ya está registrado."
 
     conexion.execute(
         """
@@ -606,24 +648,19 @@ def agregar_medicamento(
             ahora_local().isoformat(),
         ),
     )
-
     conexion.commit()
     conexion.close()
 
-    return (
-        True,
-        f"Agregué {nombre} a las {hora}.",
-    )
+    sincronizar_alarmas()
+
+    return f"Agregué {nombre} a las {hora}."
 
 
-def quitar_medicamento(nombre: str) -> tuple[bool, str]:
+def quitar_medicamento(nombre: str) -> str:
     medicamento = buscar_medicamento(nombre)
 
     if not medicamento:
-        return (
-            False,
-            "No encontré ese medicamento en la lista actual.",
-        )
+        return "No encontré ese medicamento."
 
     conexion = conectar_db()
     conexion.execute(
@@ -639,46 +676,22 @@ def quitar_medicamento(nombre: str) -> tuple[bool, str]:
 
     eliminar_alarmas_medicamento(medicamento["id"])
 
-    return (
-        True,
-        f"Quité {medicamento['nombre']} de la lista.",
-    )
+    return f"Quité {medicamento['nombre']} de la lista."
 
 
-def medicamento_tomado_hoy(medicamento_id: int) -> bool:
-    conexion = conectar_db()
-    fila = conexion.execute(
-        """
-        SELECT id
-        FROM tomas
-        WHERE medicamento_id = ? AND fecha = ?
-        """,
-        (
-            medicamento_id,
-            hoy_local().isoformat(),
-        ),
-    ).fetchone()
-    conexion.close()
-    return fila is not None
-
-
-def registrar_toma(nombre: str) -> tuple[bool, str]:
+def registrar_toma(nombre: str) -> str:
     medicamento = buscar_medicamento(nombre)
 
     if not medicamento:
-        return (
-            False,
-            "No encontré ese medicamento en la lista actual.",
-        )
+        return "No encontré ese medicamento."
 
     if medicamento_tomado_hoy(medicamento["id"]):
         return (
-            False,
-            f"{medicamento['nombre']} ya estaba registrado como tomado hoy.",
+            f"{medicamento['nombre']} ya está registrado "
+            "como tomado hoy."
         )
 
     conexion = conectar_db()
-
     conexion.execute(
         """
         INSERT INTO tomas (
@@ -696,19 +709,15 @@ def registrar_toma(nombre: str) -> tuple[bool, str]:
             ahora_local().strftime("%H:%M"),
         ),
     )
-
     conexion.commit()
     conexion.close()
 
-    cancelar_recordatorio_familiar(medicamento["id"])
+    cancelar_recordatorios(medicamento["id"])
 
-    return (
-        True,
-        f"Registré que tomaste {medicamento['nombre']} hoy.",
-    )
+    return f"Registré que tomaste {medicamento['nombre']} hoy."
 
 
-def texto_lista_medicamentos() -> str:
+def texto_medicamentos() -> str:
     medicamentos = listar_medicamentos()
 
     if not medicamentos:
@@ -737,55 +746,74 @@ def texto_lista_medicamentos() -> str:
     return " ".join(partes)
 
 
+def extraer_nombre_medicamento_agregar(texto: str) -> str:
+    texto = corregir_errores_voz(texto)
+
+    texto = re.sub(
+        r"^(?:a\s+)?(?:(?:agregar|agrega|anadir|anade|registrar|registra|programar|programa)\s+)+",
+        "",
+        texto,
+    )
+
+    texto = re.sub(
+        r"\b(?:un|una|el|la)\b",
+        " ",
+        texto,
+    )
+
+    texto = re.sub(
+        r"\b(?:medicamento|medicina|pastilla)\b",
+        " ",
+        texto,
+        count=1,
+    )
+
+    texto = re.split(
+        r"\b(?:a\s+las|las)\b",
+        texto,
+        maxsplit=1,
+    )[0]
+
+    texto = re.sub(
+        r"\b(?:una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)"
+        r"(?:\s+de\s+la\s+(?:manana|tarde|noche|madrugada))?\s*$",
+        "",
+        texto,
+    )
+
+    texto = re.sub(
+        r"\b(?:agregar|agrega|anadir|registrar|programar)\b",
+        " ",
+        texto,
+    )
+
+    texto = re.sub(r"\s+", " ", texto).strip()
+
+    return texto.title()
+
+
+def extraer_nombre_medicamento_quitar(texto: str) -> str:
+    texto = corregir_errores_voz(texto)
+
+    texto = re.sub(
+        r"^(?:quitar|quita|eliminar|elimina|borrar|borra|dejar de tomar)\s+",
+        "",
+        texto,
+    )
+
+    texto = re.sub(
+        r"\b(?:el|la|un|una|medicamento|medicina|pastilla)\b",
+        " ",
+        texto,
+    )
+
+    return re.sub(r"\s+", " ", texto).strip().title()
+
+
 # ══════════════════════════════════════════════════════════════
 # AGENDA
 # ══════════════════════════════════════════════════════════════
-def agregar_evento(
-    fecha: str,
-    hora: str,
-    descripcion: str,
-) -> tuple[bool, str]:
-    descripcion = descripcion.strip()
-
-    if not descripcion:
-        return False, "Falta la descripción del evento."
-
-    if not validar_fecha_iso(fecha):
-        return False, "La fecha no es válida."
-
-    if not validar_hora(hora):
-        return False, "La hora no es válida."
-
-    conexion = conectar_db()
-    conexion.execute(
-        """
-        INSERT INTO agenda (
-            fecha,
-            hora,
-            descripcion,
-            creado_en
-        )
-        VALUES (?, ?, ?, ?)
-        """,
-        (
-            fecha,
-            hora,
-            descripcion,
-            ahora_local().isoformat(),
-        ),
-    )
-    conexion.commit()
-    conexion.close()
-
-    return (
-        True,
-        f"Agregué {descripcion} para {fecha} a las {hora}.",
-    )
-
-
-def listar_eventos(
-    fecha: str | None = None,
-) -> list[dict]:
+def listar_eventos(fecha: str | None = None) -> list[dict]:
     conexion = conectar_db()
 
     if fecha:
@@ -813,19 +841,53 @@ def listar_eventos(
     return [dict(fila) for fila in filas]
 
 
-def quitar_evento(busqueda: str) -> tuple[bool, str]:
-    busqueda_normalizada = normalizar(busqueda)
-    eventos = listar_eventos()
+def agregar_evento(
+    descripcion: str,
+    fecha: str,
+    hora: str,
+) -> str:
+    descripcion = descripcion.strip().title()
 
+    if not descripcion:
+        return "No pude identificar el evento."
+
+    conexion = conectar_db()
+    conexion.execute(
+        """
+        INSERT INTO agenda (
+            fecha,
+            hora,
+            descripcion,
+            creado_en
+        )
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            fecha,
+            hora,
+            descripcion,
+            ahora_local().isoformat(),
+        ),
+    )
+    conexion.commit()
+    conexion.close()
+
+    return (
+        f"Agregué {descripcion} para {fecha} "
+        f"a las {hora}."
+    )
+
+
+def quitar_evento(busqueda: str) -> str:
+    busqueda = normalizar(busqueda)
     coincidencias = [
         evento
-        for evento in eventos
-        if busqueda_normalizada
-        in normalizar(evento["descripcion"])
+        for evento in listar_eventos()
+        if busqueda in normalizar(evento["descripcion"])
     ]
 
     if not coincidencias:
-        return False, "No encontré ese evento."
+        return "No encontré ese evento."
 
     evento = coincidencias[0]
 
@@ -837,19 +899,18 @@ def quitar_evento(busqueda: str) -> tuple[bool, str]:
     conexion.commit()
     conexion.close()
 
-    return (
-        True,
-        f"Quité {evento['descripcion']} de la agenda.",
-    )
+    return f"Quité {evento['descripcion']} de la agenda."
 
 
 def texto_agenda(fecha: str | None = None) -> str:
     eventos = listar_eventos(fecha)
 
     if not eventos:
-        if fecha:
-            return f"No tienes eventos para {fecha}."
-        return "No tienes eventos próximos."
+        return (
+            f"No tienes eventos para {fecha}."
+            if fecha
+            else "No tienes eventos próximos."
+        )
 
     partes = ["Tu agenda es:"]
 
@@ -862,86 +923,33 @@ def texto_agenda(fecha: str | None = None) -> str:
     return " ".join(partes)
 
 
+def extraer_descripcion_evento(texto: str) -> str:
+    texto = corregir_errores_voz(texto)
+
+    texto = re.sub(
+        r"^(?:agregar|agrega|anadir|anade|registrar|registra|agendar|agenda)\s+",
+        "",
+        texto,
+    )
+
+    texto = re.sub(
+        r"\b(?:un|una|el|la|evento|cita)\b",
+        " ",
+        texto,
+    )
+
+    texto = re.split(
+        r"\b(?:para hoy|para manana|hoy|manana|lunes|martes|miercoles|jueves|viernes|sabado|domingo|a\s+las|las)\b",
+        texto,
+        maxsplit=1,
+    )[0]
+
+    return re.sub(r"\s+", " ", texto).strip().title()
+
+
 # ══════════════════════════════════════════════════════════════
 # CONTACTOS
 # ══════════════════════════════════════════════════════════════
-def agregar_contacto(
-    nombre: str,
-    telefono: str,
-    relacion: str = "",
-    emergencia: bool = False,
-) -> tuple[bool, str]:
-    nombre = nombre.strip().title()
-    telefono = telefono.strip()
-    relacion = relacion.strip()
-
-    if not nombre:
-        return False, "Falta el nombre del contacto."
-
-    if not re.fullmatch(r"\+?\d{7,15}", telefono):
-        return (
-            False,
-            "El teléfono debe contener entre 7 y 15 dígitos.",
-        )
-
-    conexion = conectar_db()
-
-    existente = conexion.execute(
-        """
-        SELECT id
-        FROM contactos
-        WHERE lower(nombre) = lower(?)
-        """,
-        (nombre,),
-    ).fetchone()
-
-    if existente:
-        conexion.close()
-        return (
-            False,
-            f"Ya existe un contacto llamado {nombre}.",
-        )
-
-    if emergencia:
-        conexion.execute(
-            "UPDATE contactos SET emergencia = 0"
-        )
-
-    conexion.execute(
-        """
-        INSERT INTO contactos (
-            nombre,
-            telefono,
-            relacion,
-            emergencia,
-            creado_en
-        )
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            nombre,
-            telefono,
-            relacion,
-            1 if emergencia else 0,
-            ahora_local().isoformat(),
-        ),
-    )
-
-    conexion.commit()
-    conexion.close()
-
-    extra = (
-        " y lo marqué como contacto de emergencia"
-        if emergencia
-        else ""
-    )
-
-    return (
-        True,
-        f"Agregué a {nombre}{extra}.",
-    )
-
-
 def listar_contactos() -> list[dict]:
     conexion = conectar_db()
     filas = conexion.execute(
@@ -970,11 +978,76 @@ def buscar_contacto(nombre: str) -> dict | None:
     return None
 
 
-def quitar_contacto(nombre: str) -> tuple[bool, str]:
+def agregar_contacto(
+    nombre: str,
+    telefono: str,
+    relacion: str = "",
+    emergencia: bool = False,
+) -> str:
+    nombre = nombre.strip().title()
+    telefono = telefono.strip()
+
+    if not nombre:
+        return "No pude identificar el nombre del contacto."
+
+    if not re.fullmatch(r"\+?\d{7,15}", telefono):
+        return "El número debe tener entre 7 y 15 dígitos."
+
+    conexion = conectar_db()
+    existente = conexion.execute(
+        """
+        SELECT id
+        FROM contactos
+        WHERE lower(nombre) = lower(?)
+        """,
+        (nombre,),
+    ).fetchone()
+
+    if existente:
+        conexion.close()
+        return f"Ya existe un contacto llamado {nombre}."
+
+    if emergencia:
+        conexion.execute(
+            "UPDATE contactos SET emergencia = 0"
+        )
+
+    conexion.execute(
+        """
+        INSERT INTO contactos (
+            nombre,
+            telefono,
+            relacion,
+            emergencia,
+            creado_en
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            nombre,
+            telefono,
+            relacion,
+            1 if emergencia else 0,
+            ahora_local().isoformat(),
+        ),
+    )
+    conexion.commit()
+    conexion.close()
+
+    extra = (
+        " y lo marqué como contacto de emergencia"
+        if emergencia
+        else ""
+    )
+
+    return f"Agregué a {nombre}{extra}."
+
+
+def quitar_contacto(nombre: str) -> str:
     contacto = buscar_contacto(nombre)
 
     if not contacto:
-        return False, "No encontré ese contacto."
+        return "No encontré ese contacto."
 
     conexion = conectar_db()
     conexion.execute(
@@ -984,10 +1057,7 @@ def quitar_contacto(nombre: str) -> tuple[bool, str]:
     conexion.commit()
     conexion.close()
 
-    return (
-        True,
-        f"Quité a {contacto['nombre']} de tus contactos.",
-    )
+    return f"Quité a {contacto['nombre']} de tus contactos."
 
 
 def texto_contactos() -> str:
@@ -1018,8 +1088,33 @@ def texto_contactos() -> str:
     return " ".join(partes)
 
 
+def extraer_contacto_agregar(
+    texto: str,
+) -> tuple[str, str, str, bool]:
+    texto = corregir_errores_voz(texto)
+    emergencia = "emergencia" in texto
+
+    telefono_match = re.search(r"(\+?\d{7,15})", texto)
+    telefono = telefono_match.group(1) if telefono_match else ""
+
+    nombre_texto = re.sub(
+        r"^(?:agregar|agrega|anadir|anade|registrar|registra)\s+",
+        "",
+        texto,
+    )
+    nombre_texto = re.sub(
+        r"\b(?:un|una|el|la|contacto|telefono|emergencia)\b",
+        " ",
+        nombre_texto,
+    )
+    nombre_texto = re.sub(r"\+?\d{7,15}", " ", nombre_texto)
+    nombre_texto = re.sub(r"\s+", " ", nombre_texto).strip()
+
+    return nombre_texto.title(), telefono, "", emergencia
+
+
 # ══════════════════════════════════════════════════════════════
-# NOTIFICACIONES
+# NOTIFICACIONES EXTERNAS
 # ══════════════════════════════════════════════════════════════
 TWILIO_CLIENT = None
 
@@ -1027,22 +1122,15 @@ if TWILIO_SID and TWILIO_TOKEN and TWILIO_NUMERO:
     try:
         from twilio.rest import Client
 
-        TWILIO_CLIENT = Client(
-            TWILIO_SID,
-            TWILIO_TOKEN,
-        )
+        TWILIO_CLIENT = Client(TWILIO_SID, TWILIO_TOKEN)
     except Exception as error:
         logger.exception("Twilio no pudo iniciarse: %s", error)
 
 
-def llamar(telefono: str, mensaje: str) -> str:
+def llamar(telefono: str, mensaje: str) -> None:
     if not TWILIO_CLIENT:
-        logger.info(
-            "[SIMULADO] Llamada a %s: %s",
-            telefono,
-            mensaje,
-        )
-        return "Llamada simulada."
+        logger.info("[SIMULADO] Llamada a %s: %s", telefono, mensaje)
+        return
 
     try:
         twiml = (
@@ -1056,46 +1144,33 @@ def llamar(telefono: str, mensaje: str) -> str:
             to=telefono,
             from_=TWILIO_NUMERO,
         )
-
-        return "Llamada iniciada."
     except Exception as error:
         logger.exception("Error de llamada: %s", error)
-        return "No se pudo iniciar la llamada."
 
 
-def enviar_whatsapp(
-    telefono: str,
-    mensaje: str,
-) -> str:
+def enviar_whatsapp(telefono: str, mensaje: str) -> None:
     if not CALLMEBOT_PHONE or not CALLMEBOT_KEY:
-        logger.info(
-            "[SIMULADO] WhatsApp a %s: %s",
-            telefono,
-            mensaje,
-        )
-        return "Mensaje simulado."
+        logger.info("[SIMULADO] WhatsApp a %s: %s", telefono, mensaje)
+        return
 
     try:
-        url = (
-            "https://api.callmebot.com/whatsapp.php"
-            f"?phone={telefono}"
-            f"&text={quote(mensaje)}"
-            f"&apikey={CALLMEBOT_KEY}"
+        requests.get(
+            (
+                "https://api.callmebot.com/whatsapp.php"
+                f"?phone={telefono}"
+                f"&text={quote(mensaje)}"
+                f"&apikey={CALLMEBOT_KEY}"
+            ),
+            timeout=15,
         )
-        respuesta = requests.get(url, timeout=15)
-        return f"Mensaje enviado, código {respuesta.status_code}."
     except Exception as error:
         logger.exception("Error de WhatsApp: %s", error)
-        return "No se pudo enviar el mensaje."
 
 
 # ══════════════════════════════════════════════════════════════
 # ALARMAS
 # ══════════════════════════════════════════════════════════════
-SCHEDULER = BackgroundScheduler(
-    timezone=ZONA_HORARIA_NOMBRE
-)
-
+SCHEDULER = BackgroundScheduler(timezone=ZONA_HORARIA_NOMBRE)
 BOT_REF = {
     "app": None,
     "loop": None,
@@ -1106,10 +1181,7 @@ def ejecutar_en_loop(corutina) -> None:
     loop = BOT_REF.get("loop")
 
     if loop and loop.is_running():
-        asyncio.run_coroutine_threadsafe(
-            corutina,
-            loop,
-        )
+        asyncio.run_coroutine_threadsafe(corutina, loop)
     else:
         logger.error("No hay loop activo para enviar mensajes.")
 
@@ -1118,21 +1190,15 @@ def id_alarma(medicamento_id: int, chat_id: int) -> str:
     return f"med_{medicamento_id}_{chat_id}"
 
 
-def id_recordatorio(
-    medicamento_id: int,
-    chat_id: int,
-) -> str:
+def id_recordatorio(medicamento_id: int, chat_id: int) -> str:
     return f"rec_{medicamento_id}_{chat_id}"
 
 
-def eliminar_alarmas_medicamento(
-    medicamento_id: int,
-) -> None:
+def eliminar_alarmas_medicamento(medicamento_id: int) -> None:
     for trabajo in SCHEDULER.get_jobs():
-        if trabajo.id.startswith(
-            f"med_{medicamento_id}_"
-        ) or trabajo.id.startswith(
-            f"rec_{medicamento_id}_"
+        if (
+            trabajo.id.startswith(f"med_{medicamento_id}_")
+            or trabajo.id.startswith(f"rec_{medicamento_id}_")
         ):
             try:
                 trabajo.remove()
@@ -1140,25 +1206,17 @@ def eliminar_alarmas_medicamento(
                 pass
 
 
-def cancelar_recordatorio_familiar(
-    medicamento_id: int,
-) -> None:
-    for chat_id in USUARIOS_AUTORIZADOS:
+def cancelar_recordatorios(medicamento_id: int) -> None:
+    for chat_id in USUARIOS_ALARMA:
         try:
             SCHEDULER.remove_job(
-                id_recordatorio(
-                    medicamento_id,
-                    chat_id,
-                )
+                id_recordatorio(medicamento_id, chat_id)
             )
         except Exception:
             pass
 
 
-def disparar_alarma(
-    medicamento_id: int,
-    chat_id: int,
-) -> None:
+def disparar_alarma(medicamento_id: int, chat_id: int) -> None:
     conexion = conectar_db()
     fila = conexion.execute(
         """
@@ -1197,8 +1255,8 @@ def disparar_alarma(
         ]
     )
 
-    audio = crear_audio(texto)
     app = BOT_REF.get("app")
+    audio = crear_audio(texto)
 
     if app:
 
@@ -1225,22 +1283,13 @@ def disparar_alarma(
         aviso_no_confirmado,
         "date",
         run_date=ahora_local() + timedelta(minutes=15),
-        args=[
-            medicamento_id,
-            chat_id,
-        ],
-        id=id_recordatorio(
-            medicamento_id,
-            chat_id,
-        ),
+        args=[medicamento_id],
+        id=id_recordatorio(medicamento_id, chat_id),
         replace_existing=True,
     )
 
 
-def aviso_no_confirmado(
-    medicamento_id: int,
-    chat_id: int,
-) -> None:
+def aviso_no_confirmado(medicamento_id: int) -> None:
     if medicamento_tomado_hoy(medicamento_id):
         return
 
@@ -1302,12 +1351,10 @@ def sincronizar_alarmas() -> None:
         if trabajo.id.startswith("med_"):
             trabajo.remove()
 
-    medicamentos = listar_medicamentos()
-
-    for medicamento in medicamentos:
+    for medicamento in listar_medicamentos():
         hora, minuto = medicamento["hora"].split(":")
 
-        for chat_id in USUARIOS_AUTORIZADOS:
+        for chat_id in USUARIOS_ALARMA:
             SCHEDULER.add_job(
                 disparar_alarma,
                 CronTrigger(
@@ -1315,42 +1362,21 @@ def sincronizar_alarmas() -> None:
                     minute=int(minuto),
                     timezone=ZONA_HORARIA_NOMBRE,
                 ),
-                args=[
-                    medicamento["id"],
-                    chat_id,
-                ],
-                id=id_alarma(
-                    medicamento["id"],
-                    chat_id,
-                ),
+                args=[medicamento["id"], chat_id],
+                id=id_alarma(medicamento["id"], chat_id),
                 replace_existing=True,
-            )
-
-            logger.info(
-                "Alarma programada: %s, %s, chat %s",
-                medicamento["nombre"],
-                medicamento["hora"],
-                chat_id,
             )
 
 
 # ══════════════════════════════════════════════════════════════
 # NOTICIAS
 # ══════════════════════════════════════════════════════════════
-def limpiar_titulo_noticia(titulo: str) -> str:
-    titulo = html.unescape(titulo).strip()
-    titulo = re.sub(r"\s+-\s+[^-]+$", "", titulo)
-    return titulo
-
-
 def obtener_noticias(limite: int = 5) -> list[str]:
     try:
         respuesta = requests.get(
             RSS_NOTICIAS,
             timeout=15,
-            headers={
-                "User-Agent": "Mozilla/5.0"
-            },
+            headers={"User-Agent": "Mozilla/5.0"},
         )
         respuesta.raise_for_status()
 
@@ -1358,12 +1384,13 @@ def obtener_noticias(limite: int = 5) -> list[str]:
         noticias: list[str] = []
 
         for item in raiz.findall(".//item"):
-            titulo = item.findtext("title", "").strip()
+            titulo = html.unescape(
+                item.findtext("title", "")
+            ).strip()
 
             if titulo:
-                noticias.append(
-                    limpiar_titulo_noticia(titulo)
-                )
+                titulo = re.sub(r"\s+-\s+[^-]+$", "", titulo)
+                noticias.append(titulo)
 
             if len(noticias) >= limite:
                 break
@@ -1378,449 +1405,28 @@ def texto_noticias() -> str:
     noticias = obtener_noticias()
 
     if not noticias:
-        return (
-            "No pude consultar las noticias en este momento. "
-            "Intenta nuevamente más tarde."
-        )
+        return "No pude consultar las noticias en este momento."
 
     partes = ["Estas son algunas noticias recientes:"]
 
-    for indice, titulo in enumerate(noticias, start=1):
-        partes.append(f"{indice}. {titulo}.")
+    for indice, noticia in enumerate(noticias, start=1):
+        partes.append(f"{indice}. {noticia}.")
 
     return " ".join(partes)
 
 
 # ══════════════════════════════════════════════════════════════
-# PARSEO DE FECHA Y HORA
+# INTENCIONES
 # ══════════════════════════════════════════════════════════════
-def validar_hora(hora: str) -> bool:
-    try:
-        datetime.strptime(hora, "%H:%M")
-        return True
-    except ValueError:
-        return False
+def contiene(texto: str, opciones: Iterable[str]) -> bool:
+    return any(opcion in texto for opcion in opciones)
 
 
-def validar_fecha_iso(fecha: str) -> bool:
-    try:
-        datetime.strptime(fecha, "%Y-%m-%d")
-        return True
-    except ValueError:
-        return False
+def parece_agregar_medicamento(texto: str) -> bool:
+    texto = corregir_errores_voz(texto)
 
-
-def parsear_hora(texto: str) -> str | None:
-    """
-    Reconoce horas expresadas de varias formas:
-
-    - a las ocho
-    - alas ocho
-    - a la ocho
-    - las 8
-    - 8:00
-    - ocho de la mañana
-    - tres de la tarde
-    - nueve de la noche
-    - dos de la madrugada
-    """
-    texto_n = normalizar(texto)
-
-    # Normalizar puntuación y errores frecuentes de transcripción.
-    texto_n = re.sub(r"[,.;:!?]", " ", texto_n)
-    texto_n = re.sub(r"\s+", " ", texto_n).strip()
-
-    texto_n = re.sub(r"\balas\b", "a las", texto_n)
-    texto_n = re.sub(
-        r"\ba la\s+(?=\d|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)",
-        "a las ",
-        texto_n,
-    )
-
-    # Corregir variantes frecuentes.
-    texto_n = texto_n.replace("madrugrada", "madrugada")
-    texto_n = texto_n.replace("madrujada", "madrugada")
-
-    # Hora numérica como 08:00 o 8h30.
-    coincidencia = re.search(
-        r"\b([01]?\d|2[0-3])\s*[:h]\s*([0-5]\d)\b",
-        texto_n,
-    )
-
-    if coincidencia:
-        hora = int(coincidencia.group(1))
-        minuto = int(coincidencia.group(2))
-        return f"{hora:02d}:{minuto:02d}"
-
-    # Hora numérica después de "a las" o "las".
-    coincidencia = re.search(
-        r"\b(?:a\s+las|las)\s+(\d{1,2})(?:\s+y\s+(\d{1,2}))?\b",
-        texto_n,
-    )
-
-    hora = None
-    minuto = 0
-
-    if coincidencia:
-        hora = int(coincidencia.group(1))
-        minuto = int(coincidencia.group(2) or 0)
-    else:
-        numeros = {
-            "una": 1,
-            "dos": 2,
-            "tres": 3,
-            "cuatro": 4,
-            "cinco": 5,
-            "seis": 6,
-            "siete": 7,
-            "ocho": 8,
-            "nueve": 9,
-            "diez": 10,
-            "once": 11,
-            "doce": 12,
-        }
-
-        # Buscar primero una hora precedida por "a las" o "las".
-        for palabra, valor in numeros.items():
-            if re.search(
-                rf"\b(?:a\s+las|las)\s+{palabra}\b",
-                texto_n,
-            ):
-                hora = valor
-                break
-
-        # Respaldo: aceptar una hora escrita al final si el mensaje
-        # corresponde claramente a un comando de programación.
-        if hora is None and any(
-            palabra in texto_n
-            for palabra in [
-                "medicamento",
-                "medicina",
-                "pastilla",
-                "agregar",
-                "programar",
-                "registrar",
-                "evento",
-                "cita",
-                "agenda",
-            ]
-        ):
-            for palabra, valor in numeros.items():
-                if re.search(
-                    rf"\b{palabra}\b"
-                    rf"(?:\s+de\s+la\s+(?:manana|tarde|noche|madrugada))?"
-                    rf"\s*$",
-                    texto_n,
-                ):
-                    hora = valor
-                    break
-
-    if hora is None:
-        return None
-
-    # Minutos expresados con palabras.
-    if "media" in texto_n:
-        minuto = 30
-    elif "cuarto" in texto_n:
-        minuto = 15
-
-    # Detectar periodo del día.
-    es_manana = "de la manana" in texto_n
-    es_tarde = "de la tarde" in texto_n
-    es_noche = "de la noche" in texto_n
-    es_madrugada = "de la madrugada" in texto_n
-
-    # Conversión a formato de 24 horas.
-    if es_tarde and 1 <= hora <= 11:
-        hora += 12
-
-    elif es_noche and 1 <= hora <= 11:
-        hora += 12
-
-    elif es_madrugada:
-        # 12 de la madrugada = 00:00.
-        # 1 a 5 de la madrugada permanecen en formato AM.
-        if hora == 12:
-            hora = 0
-
-    elif es_manana:
-        # 12 de la mañana se interpreta como mediodía.
-        if hora == 12:
-            hora = 12
-
-    # También aceptar PM explícito.
-    elif re.search(r"\bpm\b", texto_n) and 1 <= hora <= 11:
-        hora += 12
-
-    # AM explícito: 12 AM = 00:00.
-    elif re.search(r"\bam\b", texto_n) and hora == 12:
-        hora = 0
-
-    if hora > 23 or minuto > 59:
-        return None
-
-    return f"{hora:02d}:{minuto:02d}"
-
-def parsear_fecha(texto: str) -> str:
-    texto_n = normalizar(texto)
-    hoy = hoy_local()
-
-    coincidencia_iso = re.search(
-        r"\b(20\d{2}-\d{2}-\d{2})\b",
-        texto_n,
-    )
-
-    if coincidencia_iso:
-        return coincidencia_iso.group(1)
-
-    if "pasado manana" in texto_n:
-        return (
-            hoy + timedelta(days=2)
-        ).isoformat()
-
-    if "manana" in texto_n:
-        return (
-            hoy + timedelta(days=1)
-        ).isoformat()
-
-    if "hoy" in texto_n:
-        return hoy.isoformat()
-
-    dias = {
-        "lunes": 0,
-        "martes": 1,
-        "miercoles": 2,
-        "jueves": 3,
-        "viernes": 4,
-        "sabado": 5,
-        "domingo": 6,
-    }
-
-    for nombre_dia, numero_dia in dias.items():
-        if nombre_dia in texto_n:
-            diferencia = (
-                numero_dia - hoy.weekday()
-            ) % 7
-
-            if diferencia == 0:
-                diferencia = 7
-
-            return (
-                hoy + timedelta(days=diferencia)
-            ).isoformat()
-
-    return hoy.isoformat()
-
-
-def extraer_nombre_medicamento_agregar(
-    texto: str,
-) -> str:
-    """
-    Extrae solo el nombre del medicamento, incluso con frases como:
-    "a agregar medicamento aspirina, alas ocho".
-    """
-    texto_n = corregir_transcripcion_comandos(texto)
-    texto_n = normalizar(texto_n)
-
-    texto_n = re.sub(r"[,.;:!?]", " ", texto_n)
-    texto_n = re.sub(r"\balas\b", "a las", texto_n)
-    texto_n = re.sub(r"\s+", " ", texto_n).strip()
-
-    # Eliminar muletillas y verbos repetidos al inicio.
-    texto_n = re.sub(
-        r"^(?:a\s+)?(?:(?:agregar|agrega|anadir|anade|registrar|registra|programar|programa)\s+)+",
-        "",
-        texto_n,
-    )
-
-    texto_n = re.sub(
-        r"\b(?:medicamento|medicina|pastilla)\b",
-        " ",
-        texto_n,
-        count=1,
-    )
-
-    texto_n = re.sub(
-        r"\b(?:me|mi|he|comiendo|comido|quiero|por favor)\b",
-        " ",
-        texto_n,
-    )
-
-    # Cortar antes de la hora.
-    texto_n = re.split(
-        r"\b(?:a\s+las|las)\b",
-        texto_n,
-        maxsplit=1,
-    )[0]
-
-    # Si Whisper omitió "a las", retirar una hora final escrita con palabra.
-    texto_n = re.sub(
-        r"\b(?:una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)"
-        r"(?:\s+de\s+la\s+(?:manana|tarde|noche|madrugada))?\s*$",
-        "",
-        texto_n,
-    )
-
-    texto_n = re.sub(
-        r"\b(?:dosis|debo tomar|tomar)\b.*$",
-        "",
-        texto_n,
-    )
-
-    # Quitar verbos residuales que puedan quedar por una repetición.
-    texto_n = re.sub(
-        r"\b(?:agregar|agrega|anadir|registrar|programar)\b",
-        " ",
-        texto_n,
-    )
-
-    texto_n = re.sub(r"\s+", " ", texto_n).strip()
-
-    return texto_n.title()
-
-def extraer_nombre_medicamento_quitar(
-    texto: str,
-) -> str:
-    texto_n = normalizar(texto)
-
-    texto_n = re.sub(
-        r"^(quitar|quita|eliminar|elimina|borrar|borra|dejar de tomar)\s+",
-        "",
-        texto_n,
-    )
-
-    texto_n = re.sub(
-        r"\b(medicamento|medicina|pastilla)\b",
-        "",
-        texto_n,
-    )
-
-    return texto_n.strip().title()
-
-
-def extraer_descripcion_evento(texto: str) -> str:
-    texto_n = normalizar(texto)
-
-    texto_n = re.sub(
-        r"^(agregar|agrega|anadir|anade|registrar|registra|agendar|agenda)\s+",
-        "",
-        texto_n,
-    )
-
-    texto_n = re.sub(
-        r"\b(evento|cita)\b",
-        "",
-        texto_n,
-    )
-
-    texto_n = re.split(
-        r"\b(?:para hoy|para manana|hoy|manana|lunes|martes|miercoles|jueves|viernes|sabado|domingo|a las|las)\b",
-        texto_n,
-        maxsplit=1,
-    )[0]
-
-    return texto_n.strip().title()
-
-
-def extraer_nombre_contacto_agregar(
-    texto: str,
-) -> tuple[str, str, str, bool]:
-    texto_n = normalizar(texto)
-
-    emergencia = "emergencia" in texto_n
-
-    telefono_match = re.search(
-        r"(\+?\d{7,15})",
-        texto_n,
-    )
-    telefono = (
-        telefono_match.group(1)
-        if telefono_match
-        else ""
-    )
-
-    relacion = ""
-    relacion_match = re.search(
-        r"\b(?:relacion|es mi|mi)\s+([a-zñ ]+?)(?:\s+telefono|\s+\+?\d|$)",
-        texto_n,
-    )
-
-    if relacion_match:
-        relacion = relacion_match.group(1).strip()
-
-    nombre_texto = re.sub(
-        r"^(agregar|agrega|anadir|anade|registrar|registra)\s+",
-        "",
-        texto_n,
-    )
-
-    nombre_texto = re.sub(
-        r"\b(contacto|telefono|emergencia)\b",
-        "",
-        nombre_texto,
-    )
-
-    nombre_texto = re.sub(
-        r"\+?\d{7,15}",
-        "",
-        nombre_texto,
-    )
-
-    nombre_texto = re.split(
-        r"\b(?:relacion|es mi|mi)\b",
-        nombre_texto,
-        maxsplit=1,
-    )[0]
-
-    nombre = nombre_texto.strip().title()
-
-    return nombre, telefono, relacion, emergencia
-
-
-# ══════════════════════════════════════════════════════════════
-# CEREBRO DE COMANDOS
-# ══════════════════════════════════════════════════════════════
-
-def contiene_aproximado(
-    texto: str,
-    opciones: list[str],
-    umbral: float = 0.74,
-) -> bool:
-    """
-    Detecta palabras o frases cercanas, útil cuando la voz no se
-    transcribe de forma perfecta.
-    """
-    texto_n = normalizar(texto)
-
-    if any(opcion in texto_n for opcion in opciones):
-        return True
-
-    tokens = texto_n.split()
-
-    for token in tokens:
-        if len(token) < 4:
-            continue
-
-        coincidencias = get_close_matches(
-            token,
-            opciones,
-            n=1,
-            cutoff=umbral,
-        )
-
-        if coincidencias:
-            return True
-
-    return False
-
-
-def parece_agregar_medicamento(
-    texto: str,
-) -> bool:
-    t = normalizar(texto)
-
-    tiene_verbo = contiene_aproximado(
-        t,
+    tiene_verbo = contiene(
+        texto,
         [
             "agregar",
             "agrega",
@@ -1830,294 +1436,211 @@ def parece_agregar_medicamento(
         ],
     )
 
-    menciona_otra_categoria = any(
-        palabra in t
-        for palabra in [
+    otra_categoria = contiene(
+        texto,
+        [
             "contacto",
             "telefono",
             "evento",
             "cita",
             "agenda",
-        ]
+        ],
     )
 
-    tiene_hora = parsear_hora(texto) is not None
-
-    menciona_medicamento = any(
-        palabra in t
-        for palabra in [
+    medicamento = contiene(
+        texto,
+        [
             "medicamento",
             "medicina",
             "pastilla",
-        ]
+        ],
     )
 
-    # Si dice agregar + hora y no habla de contacto/evento,
-    # se interpreta como medicamento aunque Whisper omita la palabra.
     return (
         tiene_verbo
-        and not menciona_otra_categoria
+        and not otra_categoria
         and (
-            menciona_medicamento
-            or tiene_hora
+            medicamento
+            or parsear_hora(texto) is not None
         )
     )
 
 
 def procesar_comando(texto: str) -> str:
-    original = corregir_transcripcion_comandos(
-        texto.strip()
-    )
+    original = corregir_errores_voz(texto)
     t = normalizar(original)
 
     if not t:
         return "No escuché ningún mensaje."
 
-    # Hora y fecha
-    if "que hora" in t or t == "hora":
-        return (
-            f"Son las {ahora_local().strftime('%I:%M %p')}."
-        )
+    if t in {"hora", "que hora es", "que hora"}:
+        return f"Son las {ahora_local().strftime('%I:%M %p')}."
 
-    if (
-        "que dia" in t
-        or "fecha" in t
-        or "hoy es" in t
-    ):
-        return (
-            f"Hoy es {ahora_local().strftime('%d/%m/%Y')}."
-        )
+    if contiene(t, ["que dia", "fecha", "hoy es"]):
+        return f"Hoy es {ahora_local().strftime('%d/%m/%Y')}."
 
-    # Noticias
-    if any(
-        palabra in t
-        for palabra in [
+    if contiene(
+        t,
+        [
             "noticias",
             "noticia",
-            "entretenimiento",
             "que esta pasando",
-        ]
+            "entretenimiento",
+        ],
     ):
         return texto_noticias()
 
-    # Agregar medicamento
     if parece_agregar_medicamento(original):
         hora = parsear_hora(original)
-        nombre = extraer_nombre_medicamento_agregar(
-            original
-        )
+        nombre = extraer_nombre_medicamento_agregar(original)
 
         if not nombre:
             return (
                 "Dime el nombre del medicamento. "
-                "Por ejemplo: agregar medicamento Aspirina a las ocho."
+                "Por ejemplo: agregar Aspirina a las ocho."
             )
 
         if not hora:
             return (
                 "Dime la hora. Por ejemplo: "
-                f"agregar medicamento {nombre} a las ocho."
+                f"agregar {nombre} a las ocho."
             )
 
-        exito, mensaje = agregar_medicamento(
-            nombre,
-            hora,
-        )
+        return agregar_medicamento(nombre, hora)
 
-        if exito:
-            sincronizar_alarmas()
-
-        return mensaje
-
-    # Quitar medicamento
-    if any(
-        frase in t
-        for frase in [
+    if contiene(
+        t,
+        [
             "quitar medicamento",
             "quita medicamento",
             "eliminar medicamento",
             "elimina medicamento",
             "borrar medicamento",
             "dejar de tomar",
-        ]
+        ],
     ):
-        nombre = extraer_nombre_medicamento_quitar(
-            original
-        )
+        nombre = extraer_nombre_medicamento_quitar(original)
 
         if not nombre:
-            return (
-                "Dime cuál medicamento quieres quitar."
-            )
+            return "Dime qué medicamento quieres quitar."
 
-        return quitar_medicamento(nombre)[1]
+        return quitar_medicamento(nombre)
 
-    # Registrar toma específica
-    if any(
-        frase in t
-        for frase in [
+    if contiene(
+        t,
+        [
             "ya tome",
             "ya me tome",
-            "registre que tome",
             "registrar toma",
             "marcar como tomado",
-        ]
+        ],
     ):
         medicamentos = listar_medicamentos()
 
         if not medicamentos:
             return "No tienes medicamentos registrados."
 
-        mencionado = None
-
         for medicamento in medicamentos:
-            nombre_n = normalizar(
-                medicamento["nombre"]
-            )
+            nombre_n = normalizar(medicamento["nombre"])
 
             if nombre_n in t:
-                mencionado = medicamento
-                break
-
-            palabras = [
-                palabra
-                for palabra in nombre_n.split()
-                if len(palabra) >= 4
-            ]
-
-            if any(palabra in t for palabra in palabras):
-                mencionado = medicamento
-                break
+                return registrar_toma(medicamento["nombre"])
 
         pendientes = [
             medicamento
             for medicamento in medicamentos
-            if not medicamento_tomado_hoy(
-                medicamento["id"]
-            )
+            if not medicamento_tomado_hoy(medicamento["id"])
         ]
 
-        if mencionado:
-            return registrar_toma(
-                mencionado["nombre"]
-            )[1]
-
         if len(pendientes) == 1:
-            return registrar_toma(
-                pendientes[0]["nombre"]
-            )[1]
+            return registrar_toma(pendientes[0]["nombre"])
 
-        if len(pendientes) > 1:
+        if pendientes:
             nombres = ", ".join(
                 medicamento["nombre"]
                 for medicamento in pendientes
             )
-            return (
-                "Dime cuál tomaste. "
-                f"Los pendientes son: {nombres}."
-            )
+            return f"Dime cuál tomaste. Los pendientes son: {nombres}."
 
-        return (
-            "Todos los medicamentos de hoy "
-            "ya están registrados como tomados."
-        )
+        return "Todos los medicamentos de hoy ya están tomados."
 
-    # Consultar medicamentos
-    if any(
-        frase in t
-        for frase in [
+    if contiene(
+        t,
+        [
             "mis medicamentos",
             "lista de medicamentos",
             "que medicamentos",
             "que medicinas",
             "que pastillas",
             "debo tomar",
-        ]
+        ],
     ):
-        return texto_lista_medicamentos()
+        return texto_medicamentos()
 
-    # Agregar evento
-    if any(
-        frase in t
-        for frase in [
+    if contiene(
+        t,
+        [
             "agregar evento",
             "agrega evento",
             "agendar evento",
             "agregar cita",
             "agrega cita",
             "agendar cita",
-        ]
+        ],
     ):
-        fecha = parsear_fecha(original)
         hora = parsear_hora(original)
-        descripcion = extraer_descripcion_evento(
-            original
-        )
+        fecha = parsear_fecha(original)
+        descripcion = extraer_descripcion_evento(original)
 
         if not descripcion:
-            return (
-                "Dime el nombre del evento. "
-                "Por ejemplo: agregar cita médica "
-                "para mañana a las tres."
-            )
+            return "Dime el nombre del evento."
 
         if not hora:
-            return (
-                "Dime la hora del evento."
-            )
+            return "Dime la hora del evento."
 
-        return agregar_evento(
-            fecha,
-            hora,
-            descripcion,
-        )[1]
+        return agregar_evento(descripcion, fecha, hora)
 
-    # Quitar evento
-    if any(
-        frase in t
-        for frase in [
+    if contiene(
+        t,
+        [
             "quitar evento",
             "quita evento",
             "eliminar evento",
             "elimina evento",
             "quitar cita",
             "eliminar cita",
-        ]
+        ],
     ):
         busqueda = re.sub(
-            r"^(quitar|quita|eliminar|elimina)\s+",
+            r"^(?:quitar|quita|eliminar|elimina)\s+",
             "",
             t,
         )
         busqueda = re.sub(
-            r"\b(evento|cita)\b",
-            "",
+            r"\b(?:evento|cita)\b",
+            " ",
             busqueda,
-        ).strip()
+        )
+        busqueda = re.sub(r"\s+", " ", busqueda).strip()
 
         if not busqueda:
-            return (
-                "Dime qué evento quieres quitar."
-            )
+            return "Dime qué evento quieres quitar."
 
-        return quitar_evento(busqueda)[1]
+        return quitar_evento(busqueda)
 
-    # Consultar agenda
-    if any(
-        frase in t
-        for frase in [
+    if contiene(
+        t,
+        [
             "mi agenda",
             "agenda de hoy",
             "agenda de manana",
             "mis eventos",
             "que tengo hoy",
             "que tengo manana",
-        ]
+        ],
     ):
         if "manana" in t:
-            fecha = (
-                hoy_local() + timedelta(days=1)
-            ).isoformat()
+            fecha = (hoy_local() + timedelta(days=1)).isoformat()
         elif "hoy" in t:
             fecha = hoy_local().isoformat()
         else:
@@ -2125,20 +1648,17 @@ def procesar_comando(texto: str) -> str:
 
         return texto_agenda(fecha)
 
-    # Agregar contacto
-    if any(
-        frase in t
-        for frase in [
+    if contiene(
+        t,
+        [
             "agregar contacto",
             "agrega contacto",
             "anadir contacto",
             "registrar contacto",
-        ]
+        ],
     ):
         nombre, telefono, relacion, emergencia = (
-            extraer_nombre_contacto_agregar(
-                original
-            )
+            extraer_contacto_agregar(original)
         )
 
         if not nombre or not telefono:
@@ -2152,58 +1672,43 @@ def procesar_comando(texto: str) -> str:
             telefono,
             relacion,
             emergencia,
-        )[1]
+        )
 
-    # Quitar contacto
-    if any(
-        frase in t
-        for frase in [
+    if contiene(
+        t,
+        [
             "quitar contacto",
             "quita contacto",
             "eliminar contacto",
             "elimina contacto",
-        ]
+        ],
     ):
         nombre = re.sub(
-            r"^(quitar|quita|eliminar|elimina)\s+",
+            r"^(?:quitar|quita|eliminar|elimina)\s+",
             "",
             t,
         )
-        nombre = re.sub(
-            r"\bcontacto\b",
-            "",
-            nombre,
-        ).strip()
+        nombre = re.sub(r"\bcontacto\b", " ", nombre)
+        nombre = re.sub(r"\s+", " ", nombre).strip()
 
         if not nombre:
-            return (
-                "Dime qué contacto quieres quitar."
-            )
+            return "Dime qué contacto quieres quitar."
 
-        return quitar_contacto(nombre)[1]
+        return quitar_contacto(nombre)
 
-    # Consultar contactos
-    if any(
-        frase in t
-        for frase in [
+    if contiene(
+        t,
+        [
             "mis contactos",
             "lista de contactos",
             "que contactos",
-        ]
+        ],
     ):
         return texto_contactos()
 
-    # Llamar
-    if any(
-        t.startswith(frase)
-        for frase in [
-            "llama a ",
-            "llamar a ",
-            "llamale a ",
-        ]
-    ):
+    if t.startswith(("llama a ", "llamar a ", "llamale a ")):
         nombre = re.sub(
-            r"^(llama a|llamar a|llamale a)\s+",
+            r"^(?:llama a|llamar a|llamale a)\s+",
             "",
             t,
         ).strip()
@@ -2218,21 +1723,18 @@ def procesar_comando(texto: str) -> str:
             f"Llamada de {NOMBRE_USUARIO}.",
         )
 
-        return (
-            f"Inicié la llamada a {contacto['nombre']}."
-        )
+        return f"Inicié la llamada a {contacto['nombre']}."
 
-    # Emergencia
-    if any(
-        frase in t
-        for frase in [
+    if contiene(
+        t,
+        [
             "emergencia",
             "auxilio",
             "socorro",
             "me cai",
             "me siento mal",
             "necesito ayuda",
-        ]
+        ],
     ):
         contacto = next(
             (
@@ -2244,52 +1746,31 @@ def procesar_comando(texto: str) -> str:
         )
 
         if not contacto:
-            return (
-                "No tienes un contacto de emergencia configurado."
-            )
+            return "No tienes un contacto de emergencia configurado."
 
         mensaje = (
             f"EMERGENCIA: {NOMBRE_USUARIO} "
             "necesita ayuda urgente."
         )
 
-        enviar_whatsapp(
-            contacto["telefono"],
-            mensaje,
-        )
-        llamar(
-            contacto["telefono"],
-            mensaje,
-        )
+        enviar_whatsapp(contacto["telefono"], mensaje)
+        llamar(contacto["telefono"], mensaje)
 
-        return (
-            f"Envié una alerta a {contacto['nombre']}."
-        )
+        return f"Envié una alerta a {contacto['nombre']}."
 
-    # Ayuda
-    if any(
-        palabra in t
-        for palabra in [
-            "ayuda",
-            "comandos",
-            "que puedo hacer",
-        ]
-    ):
+    if contiene(t, ["ayuda", "comandos", "que puedo hacer"]):
         return (
-            "Puedes decir: agregar medicamento Aspirina "
-            "a las ocho; quitar medicamento Aspirina; "
+            "Puedes decir: agregar medicamento Aspirina a las ocho "
+            "de la mañana; quitar medicamento Aspirina; "
             "mis medicamentos; ya tomé Aspirina; "
-            "agregar cita médica para mañana a las tres; "
+            "agregar cita médica para mañana a las tres de la tarde; "
             "quitar evento cita médica; mi agenda; "
             "agregar contacto Ana teléfono 3001234567; "
-            "quitar contacto Ana; mis contactos; "
-            "noticias; emergencia; o qué hora es."
+            "quitar contacto Ana; mis contactos; noticias; "
+            "emergencia; o qué hora es."
         )
 
-    return (
-        "No entendí el mensaje. Di ayuda "
-        "para escuchar algunos ejemplos."
-    )
+    return "No entendí el mensaje. Di ayuda para escuchar ejemplos."
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2297,16 +1778,12 @@ def procesar_comando(texto: str) -> str:
 # ══════════════════════════════════════════════════════════════
 def usuario_autorizado(update: Update) -> bool:
     chat = update.effective_chat
-    return bool(
-        chat
-        and chat.id in USUARIOS_AUTORIZADOS
-    )
+    return bool(chat and chat.id in USUARIOS_AUTORIZADOS)
 
 
 def mensaje_no_autorizado(chat_id: int) -> str:
     return (
-        "Todavía no estás autorizado para utilizar "
-        "este asistente.\n\n"
+        "Todavía no estás autorizado para utilizar este asistente.\n\n"
         f"Tu Chat ID es:\n{chat_id}\n\n"
         "Envía este número al administrador."
     )
@@ -2351,20 +1828,18 @@ async def cmd_start(
 ) -> None:
     if not usuario_autorizado(update):
         await update.message.reply_text(
-            mensaje_no_autorizado(
-                update.effective_chat.id
-            )
+            mensaje_no_autorizado(update.effective_chat.id)
         )
         return
 
+    hora = ahora_local().hour
+
     saludo = (
         "Buenos días"
-        if ahora_local().hour < 12
-        else (
-            "Buenas tardes"
-            if ahora_local().hour < 18
-            else "Buenas noches"
-        )
+        if hora < 12
+        else "Buenas tardes"
+        if hora < 18
+        else "Buenas noches"
     )
 
     texto = (
@@ -2374,11 +1849,7 @@ async def cmd_start(
         "Puedes escribir, hablar o usar los botones."
     )
 
-    await responder_con_audio(
-        update,
-        texto,
-        reply_markup=MENU,
-    )
+    await responder(update, texto, reply_markup=MENU)
 
 
 async def manejar_texto(
@@ -2387,27 +1858,28 @@ async def manejar_texto(
 ) -> None:
     if not usuario_autorizado(update):
         await update.message.reply_text(
-            mensaje_no_autorizado(
-                update.effective_chat.id
-            )
+            mensaje_no_autorizado(update.effective_chat.id)
         )
         return
 
     texto = update.message.text or ""
 
-    mapa = {
-        "Mis medicamentos": "mis medicamentos",
-        "Mi agenda": "mi agenda",
-        "Mis contactos": "mis contactos",
-        "Noticias": "noticias",
-        "EMERGENCIA": "emergencia",
-        "Ayuda": "ayuda",
-    }
+    if texto == "Mis medicamentos":
+        respuesta = texto_medicamentos()
+    elif texto == "Mi agenda":
+        respuesta = texto_agenda()
+    elif texto == "Mis contactos":
+        respuesta = texto_contactos()
+    elif texto == "Noticias":
+        respuesta = texto_noticias()
+    elif texto == "EMERGENCIA":
+        respuesta = procesar_comando("emergencia")
+    elif texto == "Ayuda":
+        respuesta = procesar_comando("ayuda")
+    else:
+        respuesta = procesar_comando(texto)
 
-    comando = mapa.get(texto, texto)
-    respuesta = procesar_comando(comando)
-
-    await responder_con_audio(
+    await responder(
         update,
         respuesta,
         reply_markup=MENU,
@@ -2420,29 +1892,26 @@ async def manejar_voz(
 ) -> None:
     if not usuario_autorizado(update):
         await update.message.reply_text(
-            mensaje_no_autorizado(
-                update.effective_chat.id
-            )
+            mensaje_no_autorizado(update.effective_chat.id)
         )
         return
 
     voz = update.message.voice or update.message.audio
 
     if not voz:
-        await update.message.reply_text(
-            "No encontré el audio."
-        )
+        await update.message.reply_text("No encontré el audio.")
         return
 
-    chat_id = update.effective_chat.id
-    ruta = f"/tmp/audio_{chat_id}_{voz.file_id}.ogg"
+    ruta = (
+        f"/tmp/audio_{update.effective_chat.id}_{voz.file_id}.ogg"
+    )
 
-    await update.message.reply_text("Escuchando y procesando tu mensaje...")
+    await update.message.reply_text(
+        "Escuchando y procesando tu mensaje..."
+    )
 
     try:
-        archivo = await context.bot.get_file(
-            voz.file_id
-        )
+        archivo = await context.bot.get_file(voz.file_id)
         await archivo.download_to_drive(ruta)
 
         texto = await asyncio.to_thread(
@@ -2451,7 +1920,7 @@ async def manejar_voz(
         )
 
         if not texto:
-            await responder_con_audio(
+            await responder(
                 update,
                 "No escuché bien. Intenta nuevamente.",
                 reply_markup=MENU,
@@ -2464,17 +1933,14 @@ async def manejar_voz(
 
         respuesta = procesar_comando(texto)
 
-        await responder_con_audio(
+        await responder(
             update,
             respuesta,
             reply_markup=MENU,
         )
     except Exception as error:
-        logger.exception(
-            "Error al procesar audio: %s",
-            error,
-        )
-        await responder_con_audio(
+        logger.exception("Error al procesar audio: %s", error)
+        await responder(
             update,
             "Ocurrió un error al procesar el audio.",
             reply_markup=MENU,
@@ -2501,54 +1967,49 @@ async def manejar_callback(
 
     await query.answer()
 
-    if not query.data:
+    if not query.data or not query.data.startswith("tomado:"):
         return
 
-    if query.data.startswith("tomado:"):
-        try:
-            medicamento_id = int(
-                query.data.split(":", 1)[1]
-            )
-        except ValueError:
-            await query.edit_message_text(
-                "No pude interpretar la confirmación."
-            )
-            return
-
-        conexion = conectar_db()
-        medicamento = conexion.execute(
-            """
-            SELECT nombre
-            FROM medicamentos
-            WHERE id = ? AND activo = 1
-            """,
-            (medicamento_id,),
-        ).fetchone()
-        conexion.close()
-
-        if not medicamento:
-            await query.edit_message_text(
-                "Ese medicamento ya no está activo."
-            )
-            return
-
-        _, mensaje = registrar_toma(
-            medicamento["nombre"]
+    try:
+        medicamento_id = int(query.data.split(":", 1)[1])
+    except ValueError:
+        await query.edit_message_text(
+            "No pude interpretar la confirmación."
         )
+        return
 
-        await query.edit_message_text(mensaje)
+    conexion = conectar_db()
+    medicamento = conexion.execute(
+        """
+        SELECT nombre
+        FROM medicamentos
+        WHERE id = ? AND activo = 1
+        """,
+        (medicamento_id,),
+    ).fetchone()
+    conexion.close()
 
-        audio = crear_audio(mensaje)
+    if not medicamento:
+        await query.edit_message_text(
+            "Ese medicamento ya no está activo."
+        )
+        return
 
-        try:
-            if audio:
-                with open(audio, "rb") as archivo:
-                    await context.bot.send_voice(
-                        chat_id=query.message.chat_id,
-                        voice=archivo,
-                    )
-        finally:
-            eliminar_temporal(audio)
+    mensaje = registrar_toma(medicamento["nombre"])
+
+    await query.edit_message_text(mensaje)
+
+    audio = await asyncio.to_thread(crear_audio, mensaje)
+
+    try:
+        if audio:
+            with open(audio, "rb") as archivo:
+                await context.bot.send_voice(
+                    chat_id=query.message.chat_id,
+                    voice=archivo,
+                )
+    finally:
+        eliminar_temporal(audio)
 
 
 async def manejar_error(
@@ -2561,12 +2022,9 @@ async def manejar_error(
     )
 
 
-async def configurar_aplicacion(
-    app: Application,
-) -> None:
+async def configurar_aplicacion(app: Application) -> None:
     BOT_REF["app"] = app
     BOT_REF["loop"] = asyncio.get_running_loop()
-
     sincronizar_alarmas()
 
 
@@ -2575,14 +2033,11 @@ async def configurar_aplicacion(
 # ══════════════════════════════════════════════════════════════
 def main() -> None:
     if not TELEGRAM_TOKEN:
-        raise RuntimeError(
-            "Falta TELEGRAM_TOKEN en Railway."
-        )
+        raise RuntimeError("Falta TELEGRAM_TOKEN en Railway.")
 
     if not USUARIOS_AUTORIZADOS:
         logger.warning(
-            "USUARIOS_AUTORIZADOS está vacío. "
-            "Solo /id funcionará."
+            "USUARIOS_AUTORIZADOS está vacío. Solo /id funcionará."
         )
 
     iniciar_db()
@@ -2597,15 +2052,9 @@ def main() -> None:
         .build()
     )
 
-    app.add_handler(
-        CommandHandler("id", cmd_id)
-    )
-    app.add_handler(
-        CommandHandler("start", cmd_start)
-    )
-    app.add_handler(
-        CommandHandler("menu", cmd_start)
-    )
+    app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu", cmd_start))
     app.add_handler(
         MessageHandler(
             filters.VOICE | filters.AUDIO,
@@ -2619,9 +2068,7 @@ def main() -> None:
         )
     )
     app.add_handler(
-        CallbackQueryHandler(
-            manejar_callback
-        )
+        CallbackQueryHandler(manejar_callback)
     )
     app.add_error_handler(manejar_error)
 
@@ -2632,9 +2079,7 @@ def main() -> None:
         ZONA_HORARIA_NOMBRE,
     )
 
-    app.run_polling(
-        drop_pending_updates=True,
-    )
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
