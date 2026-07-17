@@ -492,6 +492,14 @@ MENU = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    await update.message.reply_text(
+        f"Tu chat ID es:\n\n{chat_id}\n\n"
+        "Guarda este número para configurar el acceso autorizado."
+    )
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     sincronizar_alarmas(chat_id)
@@ -583,6 +591,7 @@ def main():
     app = Application.builder().token(CONFIG["telegram_token"]).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu",  cmd_start))
+    app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, manejar_voz))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manejar_texto))
     app.add_handler(CallbackQueryHandler(manejar_callback))
