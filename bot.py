@@ -38,6 +38,8 @@ import sqlite3
 import tempfile
 import logging
 import unicodedata
+import subprocess
+from difflib import SequenceMatcher, get_close_matches
 import xml.etree.ElementTree as ET
 from datetime import datetime, date, timedelta
 from urllib.parse import quote
@@ -63,7 +65,7 @@ from telegram.ext import (
     filters,
 )
 
-import whisper
+from faster_whisper import WhisperModel
 
 nest_asyncio.apply()
 
@@ -99,6 +101,10 @@ TWILIO_NUMERO = os.environ.get("TWILIO_NUMERO", "").strip()
 
 CALLMEBOT_PHONE = os.environ.get("CALLMEBOT_PHONE", "").strip()
 CALLMEBOT_KEY = os.environ.get("CALLMEBOT_KEY", "").strip()
+
+MODELO_VOZ = os.environ.get("MODELO_VOZ", "base").strip()
+WHISPER_BEAM_SIZE = int(os.environ.get("WHISPER_BEAM_SIZE", "3"))
+WHISPER_CPU_THREADS = int(os.environ.get("WHISPER_CPU_THREADS", "2"))
 
 try:
     ZONA_HORARIA = ZoneInfo(ZONA_HORARIA_NOMBRE)
@@ -163,29 +169,232 @@ def normalizar(texto: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════
-# VOZ
+# VOZ — faster-whisper optimizado para CPU
 # ══════════════════════════════════════════════════════════════
-print("Cargando modelo Whisper...")
-MODELO_WHISPER = whisper.load_model("tiny")
-print("Whisper listo")
+VOCABULARIO_CONTEXTO = (
+    "Acompañante Mayor. Comandos frecuentes: agregar medicamento, "
+    "quitar medicamento, medicina, pastilla, Aspirina, Metformina, "
+    "Losartán, Omeprazol, Vitamina D, ya tomé, registrar toma, "
+    "agenda, agregar cita, quitar evento, contacto, teléfono, "
+    "emergencia, noticias, mañana, hoy, ocho, nueve, diez."
+)
+
+print(f"Cargando modelo de voz '{MODELO_VOZ}'...")
+MODELO_WHISPER = WhisperModel(
+    MODELO_VOZ,
+    device="cpu",
+    compute_type="int8",
+    cpu_threads=WHISPER_CPU_THREADS,
+    num_workers=1,
+)
+print("Modelo de voz listo")
+
+
+def convertir_audio_para_whisper(
+    ruta_origen: str,
+) -> str | None:
+    """
+    Convierte el audio de Telegram a WAV mono de 16 kHz.
+    Esto mejora la precisión y reduce trabajo innecesario.
+    """
+    archivo = tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".wav",
+    )
+    archivo.close()
+
+    comando = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        ruta_origen,
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-vn",
+        archivo.name,
+    ]
+
+    try:
+        subprocess.run(
+            comando,
+            check=True,
+            timeout=30,
+        )
+        return archivo.name
+    except Exception as error:
+        logger.exception(
+            "No se pudo convertir el audio con ffmpeg: %s",
+            error,
+        )
+        eliminar_temporal(archivo.name)
+        return None
+
+
+def corregir_transcripcion_comandos(texto: str) -> str:
+    """
+    Corrige errores frecuentes de reconocimiento sin alterar nombres
+    propios ni números de forma agresiva.
+    """
+    texto_n = normalizar(texto)
+
+    reemplazos_frases = {
+        "me he comiendo": "medicamento",
+        "me comiendo": "medicamento",
+        "me he comido": "medicamento",
+        "medicamento aspirina": "medicamento aspirina",
+        "abregar": "agregar",
+        "agregarme": "agregar",
+        "agrégame": "agregar",
+        "anotar medicamento": "agregar medicamento",
+        "programar medicamento": "agregar medicamento",
+        "borrar medicina": "quitar medicamento",
+        "eliminar medicina": "quitar medicamento",
+        "quite medicamento": "quitar medicamento",
+        "ya tome": "ya tome",
+        "ya me tome": "ya me tome",
+        "registra que tome": "registrar toma",
+    }
+
+    for origen, destino in reemplazos_frases.items():
+        texto_n = texto_n.replace(origen, destino)
+
+    palabras_clave = {
+        "agregar": [
+            "agregar",
+            "agrega",
+            "abregar",
+            "agragar",
+            "agregarme",
+            "anadir",
+            "registrar",
+            "programar",
+        ],
+        "quitar": [
+            "quitar",
+            "quita",
+            "eliminar",
+            "elimina",
+            "borrar",
+            "borra",
+        ],
+        "medicamento": [
+            "medicamento",
+            "medicamentos",
+            "medicina",
+            "medicinas",
+            "pastilla",
+            "pastillas",
+        ],
+        "contacto": [
+            "contacto",
+            "contactos",
+            "telefono",
+        ],
+        "evento": [
+            "evento",
+            "eventos",
+            "cita",
+            "citas",
+            "agenda",
+        ],
+        "noticias": [
+            "noticia",
+            "noticias",
+        ],
+    }
+
+    tokens = texto_n.split()
+    corregidos = []
+
+    for token in tokens:
+        token_limpio = re.sub(r"[^a-z0-9+]", "", token)
+
+        if len(token_limpio) < 4:
+            corregidos.append(token)
+            continue
+
+        mejor_canonica = None
+        mejor_puntaje = 0.0
+
+        for canonica, variantes in palabras_clave.items():
+            for variante in variantes:
+                puntaje = SequenceMatcher(
+                    None,
+                    token_limpio,
+                    variante,
+                ).ratio()
+
+                if puntaje > mejor_puntaje:
+                    mejor_puntaje = puntaje
+                    mejor_canonica = canonica
+
+        if mejor_canonica and mejor_puntaje >= 0.72:
+            corregidos.append(mejor_canonica)
+        else:
+            corregidos.append(token)
+
+    return " ".join(corregidos)
 
 
 def transcribir_audio(ruta_audio: str) -> str:
     if not ruta_audio or not os.path.exists(ruta_audio):
         return ""
 
-    try:
-        resultado = MODELO_WHISPER.transcribe(
-            ruta_audio,
-            language="es",
-            fp16=False,
-        )
-        texto = resultado.get("text", "").strip()
-        logger.info("Transcripción: %s", texto)
-        return texto
-    except Exception as error:
-        logger.exception("Error de Whisper: %s", error)
+    ruta_wav = convertir_audio_para_whisper(
+        ruta_audio
+    )
+
+    if not ruta_wav:
         return ""
+
+    try:
+        segmentos, informacion = MODELO_WHISPER.transcribe(
+            ruta_wav,
+            language="es",
+            beam_size=WHISPER_BEAM_SIZE,
+            best_of=WHISPER_BEAM_SIZE,
+            vad_filter=True,
+            vad_parameters={
+                "min_silence_duration_ms": 350,
+                "speech_pad_ms": 200,
+            },
+            condition_on_previous_text=False,
+            initial_prompt=VOCABULARIO_CONTEXTO,
+            temperature=0.0,
+        )
+
+        texto = " ".join(
+            segmento.text.strip()
+            for segmento in segmentos
+            if segmento.text.strip()
+        ).strip()
+
+        texto_corregido = corregir_transcripcion_comandos(
+            texto
+        )
+
+        logger.info(
+            'Transcripción original: "%s"',
+            texto,
+        )
+        logger.info(
+            'Transcripción corregida: "%s"',
+            texto_corregido,
+        )
+
+        return texto_corregido
+    except Exception as error:
+        logger.exception(
+            "Error al transcribir con faster-whisper: %s",
+            error,
+        )
+        return ""
+    finally:
+        eliminar_temporal(ruta_wav)
 
 
 def crear_audio(texto: str) -> str | None:
@@ -227,12 +436,16 @@ async def responder_con_audio(
     if not update.message:
         return
 
+    # La respuesta escrita sale primero para reducir la espera percibida.
     await update.message.reply_text(
         texto,
         reply_markup=reply_markup,
     )
 
-    audio = crear_audio(texto)
+    audio = await asyncio.to_thread(
+        crear_audio,
+        texto,
+    )
 
     try:
         if audio:
@@ -1330,10 +1543,12 @@ def parsear_fecha(texto: str) -> str:
 def extraer_nombre_medicamento_agregar(
     texto: str,
 ) -> str:
-    texto_n = normalizar(texto)
+    texto_n = corregir_transcripcion_comandos(
+        texto
+    )
 
     texto_n = re.sub(
-        r"^(agregar|agrega|anadir|anade|registrar|registra)\s+",
+        r"^(agregar|agrega|anadir|anade|registrar|registra|programar|programa)\s+",
         "",
         texto_n,
     )
@@ -1341,6 +1556,12 @@ def extraer_nombre_medicamento_agregar(
     texto_n = re.sub(
         r"\b(medicamento|medicina|pastilla)\b",
         "",
+        texto_n,
+    )
+
+    texto_n = re.sub(
+        r"\b(me|mi|he|comiendo|comido|quiero|por favor)\b",
+        " ",
         texto_n,
     )
 
@@ -1461,8 +1682,94 @@ def extraer_nombre_contacto_agregar(
 # ══════════════════════════════════════════════════════════════
 # CEREBRO DE COMANDOS
 # ══════════════════════════════════════════════════════════════
+
+def contiene_aproximado(
+    texto: str,
+    opciones: list[str],
+    umbral: float = 0.74,
+) -> bool:
+    """
+    Detecta palabras o frases cercanas, útil cuando la voz no se
+    transcribe de forma perfecta.
+    """
+    texto_n = normalizar(texto)
+
+    if any(opcion in texto_n for opcion in opciones):
+        return True
+
+    tokens = texto_n.split()
+
+    for token in tokens:
+        if len(token) < 4:
+            continue
+
+        coincidencias = get_close_matches(
+            token,
+            opciones,
+            n=1,
+            cutoff=umbral,
+        )
+
+        if coincidencias:
+            return True
+
+    return False
+
+
+def parece_agregar_medicamento(
+    texto: str,
+) -> bool:
+    t = normalizar(texto)
+
+    tiene_verbo = contiene_aproximado(
+        t,
+        [
+            "agregar",
+            "agrega",
+            "anadir",
+            "registrar",
+            "programar",
+        ],
+    )
+
+    menciona_otra_categoria = any(
+        palabra in t
+        for palabra in [
+            "contacto",
+            "telefono",
+            "evento",
+            "cita",
+            "agenda",
+        ]
+    )
+
+    tiene_hora = parsear_hora(texto) is not None
+
+    menciona_medicamento = any(
+        palabra in t
+        for palabra in [
+            "medicamento",
+            "medicina",
+            "pastilla",
+        ]
+    )
+
+    # Si dice agregar + hora y no habla de contacto/evento,
+    # se interpreta como medicamento aunque Whisper omita la palabra.
+    return (
+        tiene_verbo
+        and not menciona_otra_categoria
+        and (
+            menciona_medicamento
+            or tiene_hora
+        )
+    )
+
+
 def procesar_comando(texto: str) -> str:
-    original = texto.strip()
+    original = corregir_transcripcion_comandos(
+        texto.strip()
+    )
     t = normalizar(original)
 
     if not t:
@@ -1496,21 +1803,7 @@ def procesar_comando(texto: str) -> str:
         return texto_noticias()
 
     # Agregar medicamento
-    if (
-        any(
-            verbo in t
-            for verbo in [
-                "agregar medicamento",
-                "agrega medicamento",
-                "agregar medicina",
-                "agrega medicina",
-                "agregar pastilla",
-                "agrega pastilla",
-                "anadir medicamento",
-                "registrar medicamento",
-            ]
-        )
-    ):
+    if parece_agregar_medicamento(original):
         hora = parsear_hora(original)
         nombre = extraer_nombre_medicamento_agregar(
             original
@@ -2046,7 +2339,7 @@ async def manejar_voz(
     chat_id = update.effective_chat.id
     ruta = f"/tmp/audio_{chat_id}_{voz.file_id}.ogg"
 
-    await update.message.reply_text("Escuchando...")
+    await update.message.reply_text("Escuchando y procesando tu mensaje...")
 
     try:
         archivo = await context.bot.get_file(
@@ -2054,7 +2347,10 @@ async def manejar_voz(
         )
         await archivo.download_to_drive(ruta)
 
-        texto = transcribir_audio(ruta)
+        texto = await asyncio.to_thread(
+            transcribir_audio,
+            ruta,
+        )
 
         if not texto:
             await responder_con_audio(
