@@ -1,0 +1,8 @@
+python-telegram-bot==20.7
+gtts==2.5.1
+openai-whisper==20231117
+apscheduler==3.10.4
+twilio==8.10.0
+requests==2.31.0
+pydub==0.25.1
+nest-asyncio==1.6.0
