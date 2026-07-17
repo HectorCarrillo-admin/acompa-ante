@@ -12,7 +12,10 @@ RUN apt-get update \
 
 COPY requirements.txt .
 
-RUN python -m pip install --upgrade "pip<25" "setuptools<81" wheel \
+RUN python -m pip install --upgrade \
+    "pip==24.3.1" \
+    "setuptools==69.5.1" \
+    wheel \
     && python -m pip install --no-build-isolation -r requirements.txt
 
 COPY . .
