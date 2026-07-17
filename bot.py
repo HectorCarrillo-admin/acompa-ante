@@ -47,7 +47,7 @@ FAMILIAR_ID   = int(CONFIG["familiar_chat_id"]) if CONFIG["familiar_chat_id"] el
 # ══════════════════════════════════════════════════════════════
 import whisper
 print("Cargando modelo Whisper...")
-modelo_whisper = whisper.load_model("small")
+modelo_whisper = whisper.load_model("tiny")
 print("Whisper listo")
 
 def escuchar(ruta_audio: str) -> str:
